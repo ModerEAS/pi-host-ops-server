@@ -2,7 +2,7 @@
 # (needs host `pi_svc` / project dirs) and is NOT part of this image.
 # Database file lives on a mounted volume; migrations run at startup.
 
-FROM rust:1.88-bookworm AS build
+FROM rust:1.89-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
