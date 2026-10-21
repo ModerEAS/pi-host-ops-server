@@ -54,7 +54,12 @@ crash-consistent copies of `host-ops.db`).
 - External net (default `traefik-public`, rename via `TRAEFIK_NETWORK`):
   already exists, Traefik uses it; the stack only references it.
 
-### 1.4 Docker secret (1, external — stack never creates it)
+### 1.4 Docker secret (1, external — created by CI on first deploy if absent)
+
+Normally you do nothing: the deploy job creates `host_ops_dispatcher_token`
+from the GitHub `production` environment secret `DISPATCHER_TOKEN` when it is
+missing, and leaves an existing one untouched. Manual creation is only needed
+if you deploy by hand (outside CI):
 
 ```bash
 printf '%s' '<dispatcher-token>' | docker secret create host_ops_dispatcher_token -
@@ -101,6 +106,7 @@ stack, and add `ports: ["8787:8787"]` to the service. Everything else
 | `DEPLOY_SSH_KEY` | Private key (dedicated deploy key recommended) |
 | `DEPLOY_KNOWN_HOSTS` | `ssh-keyscan -p PORT HOST` output; SSH verifies strictly |
 | `DEPLOY_PATH` | Dir on manager holding the stack, e.g. `/opt/host-ops` |
+| `DISPATCHER_TOKEN` | Dispatcher Bearer; CI creates Swarm secret `host_ops_dispatcher_token` on first deploy if absent (never recreated) |
 | `GHCR_PULL_TOKEN` | Optional; see 1.6 |
 
 ### 2.3 Environments

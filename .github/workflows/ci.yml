@@ -153,6 +153,7 @@ jobs:
           DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DISPATCHER_TOKEN: ${{ secrets.DISPATCHER_TOKEN }}
           GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
           GHCR_USER: ${{ github.repository_owner }}
           TRAEFIK_ENTRYPOINT: ${{ vars.TRAEFIK_ENTRYPOINT }}
@@ -164,6 +165,19 @@ jobs:
           # Optional login for private/rate-limited GHCR (token via stdin, never in remote command line).
           if [ -n "${GHCR_PULL_TOKEN:-}" ]; then
             printf '%s' "$GHCR_PULL_TOKEN" | SSH "docker login ghcr.io -u '${GHCR_USER}' --password-stdin"
+          fi
+          # Dispatcher token -> Swarm secret (created once, never recreated:
+          # docker secrets are immutable). Token travels via stdin only,
+          # never in the remote command line (same pattern as GHCR login).
+          if [ -z "${DISPATCHER_TOKEN:-}" ]; then
+            echo "DISPATCHER_TOKEN secret is empty — set the production environment secret DISPATCHER_TOKEN (dispatcher Bearer)" >&2
+            exit 1
+          fi
+          if SSH "docker secret inspect host_ops_dispatcher_token >/dev/null 2>&1"; then
+            echo "host_ops_dispatcher_token: exists, leaving it"
+          else
+            printf '%s' "$DISPATCHER_TOKEN" | SSH "docker secret create host_ops_dispatcher_token - >/dev/null"
+            echo "host_ops_dispatcher_token: created"
           fi
           SSH "cd '${DEPLOY_PATH}' && DEPLOY_PATH='${DEPLOY_PATH}' IMAGE_TAG='${IMAGE_TAG}' HOST_OPS_DOMAIN='${HOST_OPS_DOMAIN:-}' TRAEFIK_ENTRYPOINT='${TRAEFIK_ENTRYPOINT:-}' TRAEFIK_CERTRESOLVER='${TRAEFIK_CERTRESOLVER:-}' TRAEFIK_NETWORK='${TRAEFIK_NETWORK:-}' docker stack deploy -c stack.yml --with-registry-auth host-ops"
       - name: wait for host-ops_server to converge (timeout fails)
