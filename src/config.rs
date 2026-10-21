@@ -71,7 +71,9 @@ fn ensure_sqlite_parent(database_url: &str) -> Result<()> {
         .strip_prefix("sqlite:")
         .or_else(|| database_url.strip_prefix("sqlite://"))
         .unwrap_or(database_url);
-    let path = path.trim_start_matches('/');
+    // Keep absolute paths absolute (/data/... in containers); only strip a
+    // leading "//" left over from the sqlite:// form.
+    let path = path.strip_prefix("//").unwrap_or(path);
     let p = Path::new(path);
     if let Some(parent) = p.parent() {
         if !parent.as_os_str().is_empty() {
@@ -82,11 +84,14 @@ fn ensure_sqlite_parent(database_url: &str) -> Result<()> {
 }
 
 /// Returns (dispatcher_token, optional AGENT_TOKEN seed for default agent).
+///
+/// Docker Swarm secret support: `DISPATCHER_TOKEN_FILE` / `AGENT_TOKEN_FILE`
+/// point at a file (e.g. `/run/secrets/host_ops_dispatcher_token`); the file
+/// contents (trimmed) win over the plain env var so secrets never appear in
+/// `docker service inspect` output.
 fn load_or_bootstrap_tokens(data_dir: &Path) -> Result<(String, Option<String>)> {
-    let env_dispatcher = std::env::var("DISPATCHER_TOKEN")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let env_agent = std::env::var("AGENT_TOKEN").ok().filter(|s| !s.is_empty());
+    let env_dispatcher = read_secret_or_env("DISPATCHER_TOKEN_FILE", "DISPATCHER_TOKEN")?;
+    let env_agent = read_secret_or_env("AGENT_TOKEN_FILE", "AGENT_TOKEN")?;
 
     if let Some(d) = env_dispatcher.clone() {
         // Env dispatcher wins; agent seed optional
@@ -122,6 +127,22 @@ fn load_or_bootstrap_tokens(data_dir: &Path) -> Result<(String, Option<String>)>
     eprintln!("============================================================");
 
     Ok((dispatcher, Some(agent)))
+}
+
+/// Read a secret from `<NAME>_FILE` (file path in env) or fall back to `<NAME>`.
+/// File contents are trimmed (trailing newline from `printf`/`docker secret`).
+fn read_secret_or_env(file_env: &str, plain_env: &str) -> Result<Option<String>> {
+    if let Ok(path) = std::env::var(file_env) {
+        if !path.is_empty() {
+            let raw = fs::read_to_string(&path)
+                .with_context(|| format!("read secret file {file_env}={path}"))?;
+            let trimmed = raw.trim().to_string();
+            if !trimmed.is_empty() {
+                return Ok(Some(trimmed));
+            }
+        }
+    }
+    Ok(std::env::var(plain_env).ok().filter(|s| !s.is_empty()))
 }
 
 fn read_bootstrap_file(path: &Path) -> Result<(String, Option<String>)> {

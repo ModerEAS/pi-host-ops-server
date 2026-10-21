@@ -1,0 +1,14 @@
+.git
+.github
+.pi
+target
+data
+tmp
+*.db
+*.db-*
+.env
+Dockerfile
+docker-compose.yml
+deploy
+docs
+worker/run.sh

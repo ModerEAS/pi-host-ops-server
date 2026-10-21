@@ -1,14 +1,25 @@
 name: CI
 
+# PR: run tests + build image (no push to GHCR).
+# master / v* tag: run tests, then build and push to ghcr.io/moderras/pi-host-ops-server.
+# NOTE: image name must stay lowercase (moderras, not ModerRAS).
+# Worker is NOT containerized (needs host pi_svc / project dirs); only the
+# dispatcher server (Axum + SQLite) ships as an image.
 on:
   push:
     branches: [master, main, "feature/**"]
+    tags: ["v*"]
   pull_request:
     branches: [master, main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
+  IMAGE: ghcr.io/moderras/pi-host-ops-server
 
 jobs:
   test:
@@ -32,3 +43,169 @@ jobs:
 
       - name: cargo build --release
         run: cargo build --locked --release --bins
+
+  image:
+    name: build image (push only on master / v*)
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: validate compose config
+        run: docker compose config -q
+      - name: login GHCR
+        if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: generate tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            # master push: sha-<commit> for immutable Swarm deploys, latest tracks stable.
+            type=raw,value=sha-${{ github.sha }},enable=${{ github.ref == 'refs/heads/master' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
+      - name: build (push only on master / v*)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: smoke test image health endpoint
+        run: |
+          set -euo pipefail
+          docker buildx build --load -t host-ops-smoke:ci --cache-from type=gha .
+          docker run -d --name host-ops-smoke -p 8787:8787 host-ops-smoke:ci
+          for _ in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8787/health; then
+              echo; echo HEALTHY
+              break
+            fi
+            sleep 3
+          done
+          curl -fsS http://127.0.0.1:8787/health | grep -q '"ok":true'
+          docker rm -f host-ops-smoke
+
+  deploy:
+    name: deploy to Swarm (production)
+    runs-on: ubuntu-latest
+    needs: image
+    # Main repo master push only; forks and PRs never deploy. Server is never
+    # built on the manager — pull GHCR + `docker stack deploy` only.
+    if: github.repository == 'ModerRAS/pi-host-ops-server' && github.ref == 'refs/heads/master' && github.event_name == 'push'
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    environment: production
+    env:
+      # Must match the image job's `sha-<commit>` tag.
+      IMAGE_TAG: sha-${{ github.sha }}
+      HOST_OPS_DOMAIN: ${{ vars.HOST_OPS_DOMAIN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: setup SSH (key + known_hosts, strict host check)
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+      - name: sync stack file to manager
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          SSH() { ssh -i ~/.ssh/id_deploy -p "${DEPLOY_PORT:-22}" -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts -o BatchMode=yes "${DEPLOY_USER}@${DEPLOY_HOST}" "$@"; }
+          SSH "mkdir -p '${DEPLOY_PATH}'"
+          scp -i ~/.ssh/id_deploy -P "${DEPLOY_PORT:-22}" -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts -o BatchMode=yes \
+            deploy/stack.yml "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/"
+      - name: pull image and deploy (start-first, rollback on failure)
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+          GHCR_USER: ${{ github.repository_owner }}
+          TRAEFIK_ENTRYPOINT: ${{ vars.TRAEFIK_ENTRYPOINT }}
+          TRAEFIK_CERTRESOLVER: ${{ vars.TRAEFIK_CERTRESOLVER }}
+          TRAEFIK_NETWORK: ${{ vars.TRAEFIK_NETWORK }}
+        run: |
+          set -euo pipefail
+          SSH() { ssh -i ~/.ssh/id_deploy -p "${DEPLOY_PORT:-22}" -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts -o BatchMode=yes "${DEPLOY_USER}@${DEPLOY_HOST}" "$@"; }
+          # Optional login for private/rate-limited GHCR (token via stdin, never in remote command line).
+          if [ -n "${GHCR_PULL_TOKEN:-}" ]; then
+            printf '%s' "$GHCR_PULL_TOKEN" | SSH "docker login ghcr.io -u '${GHCR_USER}' --password-stdin"
+          fi
+          SSH "cd '${DEPLOY_PATH}' && DEPLOY_PATH='${DEPLOY_PATH}' IMAGE_TAG='${IMAGE_TAG}' HOST_OPS_DOMAIN='${HOST_OPS_DOMAIN:-}' TRAEFIK_ENTRYPOINT='${TRAEFIK_ENTRYPOINT:-}' TRAEFIK_CERTRESOLVER='${TRAEFIK_CERTRESOLVER:-}' TRAEFIK_NETWORK='${TRAEFIK_NETWORK:-}' docker stack deploy -c stack.yml --with-registry-auth host-ops"
+      - name: wait for host-ops_server to converge (timeout fails)
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+          SSH() { ssh -i ~/.ssh/id_deploy -p "${DEPLOY_PORT:-22}" -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts -o BatchMode=yes "${DEPLOY_USER}@${DEPLOY_HOST}" "$@"; }
+          WANT="ghcr.io/moderras/pi-host-ops-server:${IMAGE_TAG}"
+          for _ in $(seq 1 40); do
+            STATE="$(SSH "docker service inspect host-ops_server --format '{{.UpdateStatus.State}}'" 2>/dev/null || true)"
+            SPEC="$(SSH "docker service inspect host-ops_server --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}'" 2>/dev/null || true)"
+            # Swarm resolves to tag@sha256:..., so prefix-match instead of exact equality.
+            RUNNING="$(SSH "docker service ps host-ops_server --filter desired-state=running --format '{{.Image}} {{.CurrentState}}'" 2>/dev/null | grep -c "^${WANT}\(@[^ ]*\)\? .*Running" || true)"
+            RUNNING="${RUNNING:-0}"
+            echo "update=${STATE} spec=${SPEC} running=${RUNNING}"
+            case "${STATE}" in
+              *rollback*|*paused*) echo "update failed: ${STATE}"; exit 1;;
+            esac
+            SPEC_OK=0
+            case "${SPEC}" in
+              "${WANT}"|"${WANT}"@*) SPEC_OK=1 ;;
+            esac
+            if { [ "${SPEC_OK}" -eq 1 ] || [ "${RUNNING}" -ge 1 ]; } && [ "${RUNNING}" -ge 1 ]; then
+              echo CONVERGED
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "converge timeout"; exit 1
+      - name: public health check https://domain/health (retried)
+        run: |
+          set -euo pipefail
+          DOMAIN="${HOST_OPS_DOMAIN:-example.com}"
+          for _ in $(seq 1 30); do
+            if curl -fsS --max-time 10 "https://${DOMAIN}/health"; then
+              echo; echo HEALTHY
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "health check failed"; exit 1
+      - name: prune old images
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -i ~/.ssh/id_deploy -p "${DEPLOY_PORT:-22}" -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts -o BatchMode=yes \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" "docker image prune -f"

@@ -1,0 +1,90 @@
+# pi-host-ops Docker Swarm production stack: single server service + Traefik.
+# Worker is NOT here: it needs host `pi_svc` / project dirs, stays host-installed
+# via Release scripts (see README "Worker" + docs/deploy.md §6).
+#
+# All site-specific values are variables (defaults only for local `config` check;
+# production is injected by the CI deploy job from repo vars / secrets):
+#
+#   HOST_OPS_DOMAIN=${HOST_OPS_DOMAIN:-example.com}
+#   TRAEFIK_ENTRYPOINT=${TRAEFIK_ENTRYPOINT:-web}
+#   TRAEFIK_CERTRESOLVER=${TRAEFIK_CERTRESOLVER:-letsencrypt}
+#   TRAEFIK_NETWORK=${TRAEFIK_NETWORK:-traefik-public}
+#
+# SQLite data uses a bind mount: the manager needs ${DEPLOY_PATH} to exist
+# (e.g. `sudo mkdir -p -m 755 /opt/host-ops`); the container runs as nobody
+# (65534) and only needs that dir traversable + writable.
+# DEPLOY_PATH has no default — deploy must inject it (CI does).
+#
+# No public network? Drop the `deploy.labels` block (and the traefik-public
+# network) and publish the port instead; see docs/deploy.md §1.4.
+#
+# Usage (on manager, inside DEPLOY_PATH): IMAGE_TAG=sha-xxx HOST_OPS_DOMAIN=... \
+#   docker stack deploy -c stack.yml --with-registry-auth host-ops
+# Validate: docker compose -f deploy/stack.yml config (with and without vars).
+# First-time setup (node label, secret): see docs/deploy.md.
+
+secrets:
+  host_ops_dispatcher_token:
+    external: true
+
+networks:
+  traefik-public:
+    external: true
+    name: ${TRAEFIK_NETWORK:-traefik-public}
+
+services:
+  server:
+    image: ghcr.io/moderras/pi-host-ops-server:${IMAGE_TAG:-latest}
+    networks:
+      - traefik-public
+    environment:
+      BIND: 0.0.0.0:8787
+      DATABASE_URL: sqlite:/data/host-ops.db
+      # External secret injected as a file; server reads *_FILE first (see src/config.rs).
+      DISPATCHER_TOKEN_FILE: /run/secrets/host_ops_dispatcher_token
+      HEARTBEAT_TTL_SECS: ${HEARTBEAT_TTL_SECS:-45}
+      LEASE_SECS: ${LEASE_SECS:-60}
+      MAX_RESULT_BYTES: ${MAX_RESULT_BYTES:-524288}
+      RUST_LOG: ${RUST_LOG:-pi_host_ops_server=info,tower_http=info}
+    secrets:
+      - host_ops_dispatcher_token
+    volumes:
+      - ${DEPLOY_PATH}:/data
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.hostops.role==app
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+      restart_policy:
+        condition: any
+        delay: 5s
+        max_attempts: 0
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+        failure_action: rollback
+        monitor: 60s
+        max_failure_ratio: 0
+      rollback_config:
+        parallelism: 1
+        order: stop-first
+        monitor: 60s
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.host-ops.rule=Host(`${HOST_OPS_DOMAIN:-example.com}`)"
+        - "traefik.http.routers.host-ops.entrypoints=${TRAEFIK_ENTRYPOINT:-web}"
+        - "traefik.http.routers.host-ops.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+        - "traefik.http.services.host-ops.loadbalancer.server.port=8787"
+        - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik-public}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8787/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s

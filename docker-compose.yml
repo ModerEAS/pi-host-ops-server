@@ -1,0 +1,30 @@
+# Local dev: single server container + SQLite file in a named volume.
+# Copy .env.example to .env and fill DISPATCHER_TOKEN (or leave empty to let
+# the server write data/bootstrap-tokens.txt on first run).
+services:
+  server:
+    # Lowercase to match the GHCR name pushed by CI; `docker compose build` works locally too.
+    image: ghcr.io/moderras/pi-host-ops-server:latest
+    build: .
+    ports:
+      - "8787:8787"
+    environment:
+      BIND: 0.0.0.0:8787
+      DATABASE_URL: sqlite:/data/host-ops.db
+      DISPATCHER_TOKEN: ${DISPATCHER_TOKEN:-}
+      AGENT_TOKEN: ${AGENT_TOKEN:-}
+      HEARTBEAT_TTL_SECS: ${HEARTBEAT_TTL_SECS:-45}
+      LEASE_SECS: ${LEASE_SECS:-60}
+      MAX_RESULT_BYTES: ${MAX_RESULT_BYTES:-524288}
+      RUST_LOG: ${RUST_LOG:-pi_host_ops_server=info,tower_http=info}
+    volumes:
+      - host-ops-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8787/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+volumes:
+  host-ops-data:
