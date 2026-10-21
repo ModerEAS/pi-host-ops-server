@@ -89,6 +89,8 @@ impl Db {
         machine: Option<&str>,
         capabilities: &[String],
         max_concurrency: i64,
+        provider: Option<&str>,
+        model: Option<&str>,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let token_hash = hash_token(token);
@@ -96,8 +98,9 @@ impl Db {
         sqlx::query(
             r#"
             INSERT INTO agents (id, token_hash, label, project, cwd, machine, capabilities,
-                                max_concurrency, last_seen_at, status, created_at, revoked_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'offline', ?, NULL)
+                                max_concurrency, last_seen_at, status, created_at, revoked_at,
+                                pi_provider, pi_model)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'offline', ?, NULL, ?, ?)
             "#,
         )
         .bind(id)
@@ -109,16 +112,59 @@ impl Db {
         .bind(&caps)
         .bind(max_concurrency.max(1))
         .bind(&now)
+        .bind(provider)
+        .bind(model)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Agent self-update: cwd / project / label / provider / model.
+    pub async fn update_agent_profile(
+        &self,
+        id: &str,
+        cwd: Option<&str>,
+        project: Option<&str>,
+        label: Option<&str>,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<Option<AgentRow>> {
+        let existing = self.get_agent(id).await?;
+        let Some(row) = existing else {
+            return Ok(None);
+        };
+        if row.revoked_at.is_some() {
+            return Ok(None);
+        }
+        let cwd = cwd.filter(|s| !s.is_empty()).or(row.cwd.as_deref());
+        let project = project.filter(|s| !s.is_empty()).or(row.project.as_deref());
+        let label = label.filter(|s| !s.is_empty()).unwrap_or(row.label.as_str());
+        let provider = provider.filter(|s| !s.is_empty()).or(row.provider.as_deref());
+        let model = model.filter(|s| !s.is_empty()).or(row.model.as_deref());
+        sqlx::query(
+            r#"
+            UPDATE agents
+            SET cwd = ?, project = ?, label = ?, pi_provider = ?, pi_model = ?
+            WHERE id = ? AND revoked_at IS NULL
+            "#,
+        )
+        .bind(cwd)
+        .bind(project)
+        .bind(label)
+        .bind(provider)
+        .bind(model)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        self.get_agent(id).await
     }
 
     pub async fn find_agent_by_token_hash(&self, token_hash: &str) -> Result<Option<AgentRow>> {
         let row = sqlx::query(
             r#"
             SELECT id, token_hash, label, project, cwd, machine, capabilities,
-                   max_concurrency, last_seen_at, status, created_at, revoked_at
+                   max_concurrency, last_seen_at, status, created_at, revoked_at,
+                   pi_provider, pi_model
             FROM agents WHERE token_hash = ?
             "#,
         )
@@ -132,7 +178,8 @@ impl Db {
         let row = sqlx::query(
             r#"
             SELECT id, token_hash, label, project, cwd, machine, capabilities,
-                   max_concurrency, last_seen_at, status, created_at, revoked_at
+                   max_concurrency, last_seen_at, status, created_at, revoked_at,
+                   pi_provider, pi_model
             FROM agents WHERE id = ?
             "#,
         )
@@ -146,7 +193,8 @@ impl Db {
         let rows = sqlx::query(
             r#"
             SELECT id, token_hash, label, project, cwd, machine, capabilities,
-                   max_concurrency, last_seen_at, status, created_at, revoked_at
+                   max_concurrency, last_seen_at, status, created_at, revoked_at,
+                   pi_provider, pi_model
             FROM agents
             ORDER BY created_at ASC
             "#,
@@ -785,6 +833,8 @@ pub struct AgentRow {
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
 }
 
 impl AgentRow {
@@ -814,6 +864,8 @@ impl AgentRow {
             created_at: self.created_at,
             revoked_at: self.revoked_at,
             running_jobs,
+            provider: self.provider.clone(),
+            model: self.model.clone(),
         }
     }
 }
@@ -874,6 +926,8 @@ fn row_to_agent_row(row: SqliteRow) -> Result<AgentRow> {
         status: row.try_get("status")?,
         created_at: parse_dt(&created)?,
         revoked_at: revoked.map(|s| parse_dt(&s)).transpose()?,
+        provider: row.try_get("pi_provider").ok().flatten(),
+        model: row.try_get("pi_model").ok().flatten(),
     })
 }
 

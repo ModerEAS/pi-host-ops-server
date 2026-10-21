@@ -19,6 +19,7 @@ pub fn router() -> Router<AppState> {
         .route("/v1/agents", post(agents::create_agent).get(agents::list_agents))
         .route("/v1/agents/{id}", get(agents::get_agent).delete(agents::revoke_agent))
         // Agent worker
+        .route("/v1/agent/me", get(agent::me).patch(agent::patch_me))
         .route("/v1/agent/heartbeat", post(agent::heartbeat))
         .route("/v1/agent/poll", post(agent::poll))
         .route("/v1/agent/jobs/{id}/result", post(agent::submit_result))

@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "worker"
-path = "src/bin/worker.rs"
+path = "src/bin/worker/main.rs"
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }

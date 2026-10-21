@@ -59,6 +59,20 @@ pub async fn create_agent(
     let max_c = body.max_concurrency.unwrap_or(1).max(1);
     let token = random_token();
 
+    let provider = body.provider.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_string());
+    let model = body.model.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_string());
+    for v in [&provider, &model] {
+        if let Some(s) = v {
+            if s.to_lowercase().contains("fast") {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "provider/model must not be Fast (cost rule)" })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     match state
         .db
         .create_agent(
@@ -70,6 +84,8 @@ pub async fn create_agent(
             body.machine.as_deref().filter(|s| !s.is_empty()),
             &caps,
             max_c,
+            provider.as_deref(),
+            model.as_deref(),
         )
         .await
     {
@@ -84,6 +100,8 @@ pub async fn create_agent(
                 machine: body.machine,
                 capabilities: caps,
                 max_concurrency: max_c,
+                provider,
+                model,
             }),
         )
             .into_response(),

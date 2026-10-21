@@ -315,3 +315,82 @@ async fn hash_token_stable() {
     assert_eq!(hash_token("abc"), hash_token("abc"));
     assert_ne!(hash_token("abc"), hash_token("abd"));
 }
+
+#[tokio::test]
+async fn agent_me_returns_registration_and_rejects_dispatcher() {
+    let state = test_state("disp", None).await;
+    let (s, created) = json_req(
+        state.clone(),
+        "POST",
+        "/v1/agents",
+        Some("disp"),
+        Some(json!({
+            "id": "proj-a",
+            "label": "Project A",
+            "project": "alpha",
+            "cwd": "/tmp/alpha-workdir",
+            "capabilities": ["shell"]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{created}");
+    let token = created["token"].as_str().unwrap();
+
+    let (s, me) = json_req(state.clone(), "GET", "/v1/agent/me", Some(token), None).await;
+    assert_eq!(s, StatusCode::OK, "{me}");
+    assert_eq!(me["id"], "proj-a");
+    assert_eq!(me["project"], "alpha");
+    assert_eq!(me["cwd"], "/tmp/alpha-workdir");
+
+    // Dispatcher token must not use agent /me
+    let (s, _) = json_req(state, "GET", "/v1/agent/me", Some("disp"), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn agent_patch_me_updates_cwd_and_model() {
+    let state = test_state("disp", None).await;
+    let (s, created) = json_req(
+        state.clone(),
+        "POST",
+        "/v1/agents",
+        Some("disp"),
+        Some(json!({
+            "id": "proj-b",
+            "label": "B",
+            "project": "beta",
+            "cwd": "/tmp/old",
+            "provider": "opencode-go",
+            "model": "muse-spark-1.3-contributor",
+            "capabilities": ["shell"]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{created}");
+    let token = created["token"].as_str().unwrap();
+
+    let (s, me) = json_req(
+        state.clone(),
+        "PATCH",
+        "/v1/agent/me",
+        Some(token),
+        Some(json!({
+            "cwd": "/tmp/new-workdir",
+            "model": "muse-spark-1.3-contributor"
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{me}");
+    assert_eq!(me["cwd"], "/tmp/new-workdir");
+    assert_eq!(me["model"], "muse-spark-1.3-contributor");
+
+    let (s, _) = json_req(
+        state,
+        "PATCH",
+        "/v1/agent/me",
+        Some(token),
+        Some(json!({"model": "something-fast"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+}

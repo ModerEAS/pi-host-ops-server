@@ -1,48 +1,39 @@
-# host-ops worker（box 侧）
+# host-ops worker
 
-Rust binary that bridges `pi-host-ops-server` to local **`pi_svc`**. Per-agent Bearer token. Streams progress via `/events`.
+One local process with an embedded **WebUI** (`http://127.0.0.1:8788/`).
 
-The previous Python worker (`host_ops_worker.py`) has been removed.
+- Add **directories** (each = one agent / one `pi_svc` session)
+- Per directory: label, path, enabled, **provider + model** (default `opencode-go` / `muse-spark-1.3-contributor`; **Fast blocked**)
+- Settings: host-ops URL, dispatcher token (bootstrap), optional `PI_SVC` path
+- Config only under user config dir — **never** inside project trees:
+  - Linux/mac: `~/.config/pi-host-ops/config.json` (or `$XDG_CONFIG_HOME/pi-host-ops/`)
+  - Windows: `%APPDATA%\pi-host-ops\config.json`
 
-## Behavior
+## Production (no cargo)
 
-1. `POST /v1/agent/heartbeat` on an interval
-2. `POST /v1/agent/poll` long-poll
-3. On job:
-   - **`shell`** + `payload.command` → local `bash -c`
-   - else → `pi_svc` with **`delivery_mode`**:
-     - **`steer`** (server default) → `pi_svc send --steer`
-     - **`queue`** + idle → `send`; + busy → `send --follow-up`
-4. While waiting: POST `text` / `tool` / `status` events; renew lease
-5. `POST /v1/agent/jobs/:id/result`
-6. Session default **`host-ops`**; never stop other sessions; model **muse-spark** (no Fast)
-
-## Env
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `HOST_OPS_URL` | `http://127.0.0.1:8787` | Server |
-| `AGENT_TOKEN` | *(required)* | This agent's token |
-| `AGENT_ID` | `box-pi` | Log / `X-Agent-Id` label (auth is token) |
-| `PI_SVC` | `/workspace/pi-runs/pi_svc` | CLI |
-| `PI_SESSION` | `host-ops` | Session name |
-| `WORK_DIR` | `…/workspace` | cwd |
-| `POLL_WAIT_SECS` | `20` | Long-poll |
-| `HEARTBEAT_SECS` | `20` | Heartbeat interval |
-| `EVENT_INTERVAL_SECS` | `5` | Progress event cadence |
-| `PI_PROVIDER` / `PI_MODEL` | `opencode-go` / `muse-spark-1.3-contributor` | No Fast |
-
-## Run
+Download from GitHub Releases:
 
 ```bash
-# Create agent via dispatcher, then:
-export AGENT_TOKEN='<token from POST /v1/agents>'
-
-# Preferred:
-cargo run --release --bin worker
-
-# Or helper (loads .env / bootstrap-tokens.txt):
-./worker/run.sh
+./scripts/install-worker.sh --run
+# Windows:
+powershell -ExecutionPolicy Bypass -File scripts\install-worker.ps1 -Run
 ```
 
-Or use seeded `default` token from `data/bootstrap-tokens.txt` / `AGENT_TOKEN` env.
+Then open the WebUI, paste dispatcher token, add project directories.
+
+## Dev only
+
+```bash
+cargo run --release --bin worker
+# or
+./worker/run.sh   # uses target/release if present; else warns and uses cargo
+```
+
+## Behaviour
+
+1. WebUI edits save to user config dir
+2. For each enabled directory: register agent (dispatcher token) once, store token in config, heartbeat + poll
+3. Jobs run with that directory as cwd; `pi_svc start --provider --model` uses the directory’s model
+4. Without `pi_svc`, only `shell` jobs succeed (typical early Windows setup)
+
+Never uses Cursor CloudAgent / Fast.

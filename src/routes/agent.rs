@@ -9,10 +9,100 @@ use uuid::Uuid;
 use crate::auth::{require_agent, AuthUser};
 use crate::db::{AppendEventOutcome, LeaseOutcome, SubmitOutcome};
 use crate::models::{
-    AppendEventRequest, HeartbeatRequest, HeartbeatResponse, LeaseResponse, PollRequest,
-    PollResponse, SubmitResultRequest,
+    AppendEventRequest, HeartbeatRequest, HeartbeatResponse, LeaseResponse, PatchAgentMeRequest,
+    PollRequest, PollResponse, SubmitResultRequest,
 };
 use crate::AppState;
+
+/// Authenticated agent fetches its own registration (cwd/project/capabilities).
+/// Workers call this on startup so install scripts only need AGENT_TOKEN + HOST_OPS_URL.
+pub async fn me(State(state): State<AppState>, user: AuthUser) -> Response {
+    let agent_id = match require_agent(&user) {
+        Ok(id) => id.to_string(),
+        Err(e) => return e.into_response(),
+    };
+
+    match state.db.get_agent(&agent_id).await {
+        Ok(Some(row)) => {
+            if row.revoked_at.is_some() {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "agent revoked" })),
+                )
+                    .into_response();
+            }
+            let running = state.db.count_running_for_agent(&row.id).await.ok();
+            Json(row.to_public(state.config.heartbeat_ttl_secs, running)).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "agent not found" })),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::error!(?err, "agent me failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "failed to load agent" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn patch_me(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(body): Json<PatchAgentMeRequest>,
+) -> Response {
+    let agent_id = match require_agent(&user) {
+        Ok(id) => id.to_string(),
+        Err(e) => return e.into_response(),
+    };
+
+    for v in [&body.provider, &body.model] {
+        if let Some(s) = v {
+            if s.to_lowercase().contains("fast") {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "provider/model must not be Fast (cost rule)" })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    match state
+        .db
+        .update_agent_profile(
+            &agent_id,
+            body.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            body.project.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            body.label.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            body.provider.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            body.model.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+        )
+        .await
+    {
+        Ok(Some(row)) => {
+            let running = state.db.count_running_for_agent(&row.id).await.ok();
+            Json(row.to_public(state.config.heartbeat_ttl_secs, running)).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "agent not found or revoked" })),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::error!(?err, "patch agent me failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "failed to update agent" })),
+            )
+                .into_response()
+        }
+    }
+}
 
 pub async fn heartbeat(
     State(state): State<AppState>,

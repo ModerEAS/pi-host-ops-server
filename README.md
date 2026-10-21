@@ -150,16 +150,44 @@ Statuses: `queued` | `running` | `succeeded` | `failed` | `timed_out` | `no_agen
 - `001_init` — jobs table
 - `002_agents_routing` — `agents` + job target / `delivery_mode` (default **steer**) / lease / timeout
 - `003_job_events` — incremental feedback
+- `004_agent_model` — per-agent `pi_provider` / `pi_model`
 
-## Worker
+## Worker (embedded WebUI)
 
-Rust binary (`cargo run --release --bin worker`). See **[worker/README.md](worker/README.md)**. Uses `AGENT_TOKEN` for the registered agent (often `default` or a token from `POST /v1/agents`).
+One local **worker** process manages many project directories via a small WebUI.
+
+- Open **http://127.0.0.1:8788/** after starting the worker
+- Add directories (each = one agent / pi_svc session) and set **provider/model** per dir
+- Config: `~/.config/pi-host-ops/config.json` or `%APPDATA%\pi-host-ops\config.json` — **never** project litter
+- Default model: `muse-spark-1.3-contributor` / `opencode-go` — **Fast is blocked** (UI + API)
+- Change model: edit the directory row in the WebUI (or `provider`/`model` on `POST /v1/agents` / `PATCH /v1/agent/me`)
+
+See **[worker/README.md](worker/README.md)**.
+
+### Production — download from GitHub Releases (no cargo on the machine)
+
+```bash
+# Linux/mac
+./scripts/install-worker.sh --run
+
+# Windows
+powershell -ExecutionPolicy Bypass -File scripts\install-worker.ps1 -Run
+```
+
+Assets (after a `v*` tag / Release workflow): `worker-linux-x64`, `worker-windows-x64.exe`, `pi-host-ops-server-*`, `SHA256SUMS`.
+
+### Dev only
 
 ```bash
 cargo run --release                   # terminal A — server
-cargo run --release --bin worker      # terminal B — worker
-# or: ./worker/run.sh                 # loads .env / bootstrap-tokens.txt
+cargo run --release --bin worker      # terminal B — WebUI + pollers
+# or: ./worker/run.sh
 ```
+
+### Agent self APIs
+
+- `GET /v1/agent/me` — agent reads its registration (cwd/project/provider/model)
+- `PATCH /v1/agent/me` — agent updates cwd / provider / model (Fast rejected)
 
 ## Tests / smoke
 

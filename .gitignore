@@ -5,3 +5,5 @@
 *.db-*
 .DS_Store
 __pycache__/
+# Worker config lives in ~/.config or %APPDATA% — never commit local secrets
+.host-ops-agent.json

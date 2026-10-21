@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>pi-host-ops worker</title>
+<style>
+  :root { --bg:#0f1419; --card:#1a2332; --fg:#e7ecf3; --muted:#8b9bb4; --acc:#3b82f6; --bad:#ef4444; --ok:#22c55e; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:16px 20px; border-bottom:1px solid #243044; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; flex:1; }
+  main { padding:20px; max-width:1100px; margin:0 auto; display:grid; gap:16px; }
+  .card { background:var(--card); border:1px solid #243044; border-radius:10px; padding:16px; }
+  label { display:block; color:var(--muted); font-size:12px; margin:8px 0 4px; }
+  input, select { width:100%; padding:8px 10px; border-radius:6px; border:1px solid #334155; background:#0b1220; color:var(--fg); }
+  button { background:var(--acc); color:#fff; border:0; border-radius:6px; padding:8px 14px; cursor:pointer; }
+  button.secondary { background:#334155; }
+  button.danger { background:var(--bad); }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:8px; border-bottom:1px solid #243044; vertical-align:top; }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .muted { color:var(--muted); }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; }
+  .pill.on { background:#14532d; color:#bbf7d0; }
+  .pill.off { background:#3f1d1d; color:#fecaca; }
+  .actions { display:flex; gap:8px; flex-wrap:wrap; }
+  .err { color:#fecaca; white-space:pre-wrap; }
+  @media (max-width:720px){ .row{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<header>
+  <h1>pi-host-ops worker</h1>
+  <span class="muted" id="bindHint"></span>
+  <button class="secondary" onclick="loadAll()">Refresh</button>
+</header>
+<main>
+  <section class="card">
+    <h2 style="margin:0 0 8px;font-size:15px">Settings</h2>
+    <p class="muted">Config lives in the user config dir (never inside project folders). Default model: muse-spark. Fast is blocked.</p>
+    <div class="row">
+      <div>
+        <label>Host ops URL</label>
+        <input id="hostOpsUrl" placeholder="http://127.0.0.1:8787"/>
+      </div>
+      <div>
+        <label>WebUI bind</label>
+        <input id="webuiBind" placeholder="127.0.0.1:8788"/>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Dispatcher token (bootstrap new dirs)</label>
+        <input id="dispatcherToken" type="password" autocomplete="off"/>
+      </div>
+      <div>
+        <label>Default PI_SVC path (optional)</label>
+        <input id="piSvc" placeholder="empty = shell-only until set"/>
+      </div>
+    </div>
+    <div class="actions" style="margin-top:12px">
+      <button onclick="saveSettings()">Save settings</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2 style="margin:0 0 8px;font-size:15px">Directories (= agents)</h2>
+    <p class="muted">Each enabled directory is one agent / one pi_svc session. Change model per directory below.</p>
+    <table>
+      <thead><tr><th>Label / path</th><th>Model</th><th>Status</th><th></th></tr></thead>
+      <tbody id="dirRows"></tbody>
+    </table>
+    <h3 style="margin:16px 0 8px;font-size:14px">Add directory</h3>
+    <div class="row">
+      <div>
+        <label>Label</label>
+        <input id="newLabel" placeholder="my-project"/>
+      </div>
+      <div>
+        <label>Absolute path</label>
+        <input id="newPath" placeholder="/path/to/project"/>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Provider</label>
+        <input id="newProvider" value="opencode-go"/>
+      </div>
+      <div>
+        <label>Model (no Fast)</label>
+        <input id="newModel" value="muse-spark-1.3-contributor"/>
+      </div>
+    </div>
+    <div class="actions" style="margin-top:12px">
+      <button onclick="addDir()">Add</button>
+    </div>
+  </section>
+  <pre class="err" id="errBox"></pre>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+function err(e){ $('errBox').textContent = e || ''; }
+async function api(path, opts){
+  const r = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts||{}));
+  const t = await r.text();
+  let j=null; try{ j=t?JSON.parse(t):null; }catch(_){ j={raw:t}; }
+  if(!r.ok) throw new Error((j && (j.error||j.message)) || t || r.status);
+  return j;
+}
+function isFast(s){ return (s||'').toLowerCase().includes('fast'); }
+async function loadAll(){
+  err('');
+  try{
+    const cfg = await api('/api/config');
+    $('hostOpsUrl').value = cfg.host_ops_url||'';
+    $('webuiBind').value = cfg.webui_bind||'';
+    $('dispatcherToken').value = cfg.dispatcher_token||'';
+    $('piSvc').value = cfg.pi_svc||'';
+    $('bindHint').textContent = 'UI ' + (cfg.webui_bind||'') + ' · ' + (cfg.config_path||'');
+    const st = await api('/api/status');
+    const rows = $('dirRows'); rows.innerHTML='';
+    (cfg.directories||[]).forEach(d=>{
+      const s = (st.directories||[]).find(x=>x.id===d.id) || {};
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>
+          <strong>${escapeHtml(d.label||'')}</strong><br/>
+          <span class="muted">${escapeHtml(d.path||'')}</span><br/>
+          <span class="muted">agent: ${escapeHtml(d.agent_id||'(pending)')}</span>
+        </td>
+        <td style="min-width:220px">
+          <input data-k="provider" data-id="${d.id}" value="${escapeAttr(d.provider||'opencode-go')}"/><br/>
+          <input data-k="model" data-id="${d.id}" value="${escapeAttr(d.model||'muse-spark-1.3-contributor')}" style="margin-top:6px"/>
+        </td>
+        <td>
+          <span class="pill ${d.enabled?'on':'off'}">${d.enabled?'enabled':'disabled'}</span><br/>
+          <span class="muted">${escapeHtml(s.state||'idle')}</span>
+          ${s.last_error ? '<div class="err">'+escapeHtml(s.last_error)+'</div>':''}
+        </td>
+        <td class="actions">
+          <button class="secondary" onclick="saveDir('${d.id}')">Save</button>
+          <button class="secondary" onclick="toggleDir('${d.id}', ${d.enabled? 'false':'true'})">${d.enabled?'Disable':'Enable'}</button>
+          <button class="danger" onclick="delDir('${d.id}')">Delete</button>
+        </td>`;
+      rows.appendChild(tr);
+    });
+  }catch(e){ err(String(e)); }
+}
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
+function escapeAttr(s){ return escapeHtml(s).replace(/`/g,''); }
+async function saveSettings(){
+  err('');
+  try{
+    await api('/api/settings', {method:'PUT', body: JSON.stringify({
+      host_ops_url: $('hostOpsUrl').value.trim(),
+      webui_bind: $('webuiBind').value.trim(),
+      dispatcher_token: $('dispatcherToken').value,
+      pi_svc: $('piSvc').value.trim() || null
+    })});
+    await loadAll();
+  }catch(e){ err(String(e)); }
+}
+async function addDir(){
+  err('');
+  const provider=$('newProvider').value.trim();
+  const model=$('newModel').value.trim();
+  if(isFast(provider)||isFast(model)){ err('Fast provider/model is not allowed'); return; }
+  try{
+    await api('/api/directories', {method:'POST', body: JSON.stringify({
+      label: $('newLabel').value.trim() || undefined,
+      path: $('newPath').value.trim(),
+      provider, model, enabled: true
+    })});
+    $('newLabel').value=''; $('newPath').value='';
+    await loadAll();
+  }catch(e){ err(String(e)); }
+}
+async function saveDir(id){
+  err('');
+  const provider = document.querySelector(`input[data-id="${id}"][data-k="provider"]`).value.trim();
+  const model = document.querySelector(`input[data-id="${id}"][data-k="model"]`).value.trim();
+  if(isFast(provider)||isFast(model)){ err('Fast provider/model is not allowed'); return; }
+  try{
+    await api('/api/directories/'+id, {method:'PATCH', body: JSON.stringify({provider, model})});
+    await loadAll();
+  }catch(e){ err(String(e)); }
+}
+async function toggleDir(id, enabled){
+  try{ await api('/api/directories/'+id, {method:'PATCH', body: JSON.stringify({enabled})}); await loadAll(); }
+  catch(e){ err(String(e)); }
+}
+async function delDir(id){
+  if(!confirm('Remove this directory from worker config?')) return;
+  try{ await api('/api/directories/'+id, {method:'DELETE'}); await loadAll(); }
+  catch(e){ err(String(e)); }
+}
+loadAll();
+setInterval(loadAll, 5000);
+</script>
+</body>
+</html>

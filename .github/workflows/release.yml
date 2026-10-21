@@ -1,0 +1,199 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create/publish (e.g. v0.1.0). Leave empty to use the pushed tag."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build-${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            server: pi-host-ops-server-linux-x64
+            worker: worker-linux-x64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            server: pi-host-ops-server-windows-x64.exe
+            worker: worker-windows-x64.exe
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            server: pi-host-ops-server-linux-arm64
+            worker: worker-linux-arm64
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+            server: pi-host-ops-server-darwin-x64
+            worker: worker-darwin-x64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+            server: pi-host-ops-server-darwin-arm64
+            worker: worker-darwin-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross (linux aarch64)
+        if: matrix.cross == true
+        run: cargo install cross --locked
+
+      - name: Build (native)
+        if: matrix.cross != true
+        run: cargo build --locked --release --target ${{ matrix.target }} --bins
+
+      - name: Build (cross)
+        if: matrix.cross == true
+        run: cross build --locked --release --target ${{ matrix.target }} --bins
+
+      - name: Stage binaries (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          SRC="target/${{ matrix.target }}/release"
+          cp "$SRC/pi-host-ops-server" "dist/${{ matrix.server }}"
+          cp "$SRC/worker" "dist/${{ matrix.worker }}"
+          chmod +x "dist/${{ matrix.server }}" "dist/${{ matrix.worker }}"
+          (cd dist && sha256sum "${{ matrix.server }}" "${{ matrix.worker }}" > SHA256SUMS-${{ matrix.target }}.txt)
+          ls -la dist
+
+      - name: Stage binaries (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $src = "target/${{ matrix.target }}/release"
+          Copy-Item "$src/pi-host-ops-server.exe" "dist/${{ matrix.server }}"
+          Copy-Item "$src/worker.exe" "dist/${{ matrix.worker }}"
+          $hashes = @()
+          foreach ($f in @("${{ matrix.server }}", "${{ matrix.worker }}")) {
+            $h = (Get-FileHash -Algorithm SHA256 "dist/$f").Hash.ToLower()
+            $hashes += "$h  $f"
+          }
+          $hashes | Set-Content -Encoding ascii "dist/SHA256SUMS-${{ matrix.target }}.txt"
+          Get-ChildItem dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish-release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.tag }}" ]]; then
+            TAG="${{ inputs.tag }}"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            echo "No tag: push a v* tag or pass workflow_dispatch.tag" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: binaries-*
+          merge-multiple: true
+
+      - name: Collect assets + combined SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find artifacts -type f -print
+          # download-artifact with merge-multiple puts files flat or nested; normalize
+          find artifacts -type f \( -name 'worker-*' -o -name 'pi-host-ops-server-*' -o -name 'SHA256SUMS-*' \) \
+            -exec cp -v {} release-assets/ \;
+          cd release-assets
+          cat SHA256SUMS-*.txt | sort > SHA256SUMS
+          ls -la
+          cat SHA256SUMS
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          draft: false
+          generate_release_notes: true
+          body: |
+            ## Binaries
+
+            Download the asset for your OS (no cargo required on the target machine).
+
+            | Asset | Platform |
+            |-------|----------|
+            | `worker-linux-x64` | Linux x86_64 worker |
+            | `worker-windows-x64.exe` | Windows x86_64 worker |
+            | `worker-linux-arm64` | Linux aarch64 worker |
+            | `worker-darwin-x64` / `worker-darwin-arm64` | macOS |
+            | `pi-host-ops-server-*` | Server binaries (same platforms) |
+            | `SHA256SUMS` | Checksums |
+
+            ### Install worker (Windows)
+
+            ```powershell
+            powershell -ExecutionPolicy Bypass -File scripts\install-worker.ps1 -Repo ModerRAS/pi-host-ops-server -Version ${{ steps.tag.outputs.tag }} -AgentToken '<token>' -HostOpsUrl 'https://your-server:8787' -Run
+            ```
+
+            Or after cloning this repo at the release tag, run the script from `scripts/`.
+
+            ### Install worker (Linux)
+
+            ```bash
+            ./scripts/install-worker.sh --repo ModerRAS/pi-host-ops-server --version ${{ steps.tag.outputs.tag }} \
+              --agent-token '<token>' --host-ops-url 'https://your-server:8787' --run
+            ```
+
+            First release after merge: create a `v*` tag on `master` (or run this workflow with `tag` input).
+          files: |
+            release-assets/worker-*
+            release-assets/pi-host-ops-server-*
+            release-assets/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

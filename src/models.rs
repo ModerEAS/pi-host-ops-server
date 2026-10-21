@@ -231,6 +231,10 @@ pub struct CreateAgentRequest {
     pub machine: Option<String>,
     pub capabilities: Option<Vec<String>>,
     pub max_concurrency: Option<i64>,
+    /// Pi provider (e.g. opencode-go). Never Fast.
+    pub provider: Option<String>,
+    /// Pi model (e.g. muse-spark-1.3-contributor). Never Fast.
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -247,6 +251,10 @@ pub struct CreateAgentResponse {
     pub machine: Option<String>,
     pub capabilities: Vec<String>,
     pub max_concurrency: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,6 +279,19 @@ pub struct Agent {
     /// Running jobs currently claimed by this agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub running_jobs: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchAgentMeRequest {
+    pub cwd: Option<String>,
+    pub project: Option<String>,
+    pub label: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
