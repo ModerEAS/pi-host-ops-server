@@ -409,7 +409,26 @@ async fn ensure_session(rt: &DirRuntime) -> Result<()> {
     Ok(())
 }
 
+fn payload_prompt_text(payload: &Value) -> Option<String> {
+    for key in ["prompt", "message", "text"] {
+        if let Some(s) = payload.get(key).and_then(|v| v.as_str()) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Build text sent to `pi_svc send [--steer] --file`.
+/// When payload has `prompt` / `message` / `text`, send that string nearly as-is
+/// (one-line job_id prefix only) — used by `host-ops steer` corrections.
+/// Otherwise wrap the full job JSON in the legacy boilerplate template.
 fn build_pi_prompt(job: &Job) -> String {
+    if let Some(text) = payload_prompt_text(&job.payload) {
+        return format!("[host-ops job {}]\n{}", job.id, text);
+    }
     let payload_json = serde_json::to_string_pretty(&job.payload).unwrap_or_else(|_| "{}".into());
     format!(
         "你是 host-ops worker 驱动的 Pi 会话。完成下面远程任务并用中英简短总结。不要 Fast / CloudAgent。\n\n\

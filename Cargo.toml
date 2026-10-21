@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "worker"
 path = "src/bin/worker/main.rs"
 
+[[bin]]
+name = "host-ops"
+path = "src/bin/host-ops/main.rs"
+
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
@@ -32,7 +36,9 @@ rand = "0.8"
 hex = "0.4"
 sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+clap = { version = "4.6.7", features = ["derive"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
