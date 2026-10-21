@@ -22,6 +22,42 @@ env:
   IMAGE: ghcr.io/moderras/pi-host-ops-server
 
 jobs:
+  version:
+    name: resolve next release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags: find the latest vX.Y.Z release tag.
+          fetch-depth: 0
+      - id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_VER="$(awk 'BEGIN{p=0} /^\[package\]/{p=1; next} /^\[/{p=0} p && /^version[[:space:]]*=/ {gsub(/^[^"]*"/,""); gsub(/".*/,""); print; exit}' Cargo.toml)"
+          NEXT="$(python3 - "$CARGO_VER" <<'EOF'
+          import re, subprocess, sys
+          cargo = sys.argv[1]
+          assert re.fullmatch(r'\d+\.\d+\.\d+', cargo), f"bad Cargo [package] version {cargo!r}"
+          out = subprocess.run(['git', 'tag', '--list', 'v*'], capture_output=True, text=True, check=True).stdout
+          tags = [t[1:] for t in out.split() if re.fullmatch(r'v\d+\.\d+\.\d+', t)]
+          key = lambda s: tuple(int(x) for x in s.split('.'))
+          latest = max(tags, key=key) if tags else None
+          if latest is None or key(cargo) > key(latest):
+              nxt = cargo  # no tags yet, or manual minor/major bump in Cargo.toml
+          else:
+              m = list(key(latest)); m[2] += 1
+              nxt = '.'.join(map(str, m))
+          print(nxt)
+          EOF
+          )"
+          echo "cargo=${CARGO_VER} next=${NEXT}"
+          echo "version=${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${NEXT}" >> "$GITHUB_OUTPUT"
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -47,7 +83,7 @@ jobs:
   image:
     name: build image (push only on master / v*)
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, version]
     permissions:
       contents: read
       packages: write
@@ -76,6 +112,8 @@ jobs:
             # master push: sha-<commit> for immutable Swarm deploys, latest tracks stable.
             type=raw,value=sha-${{ github.sha }},enable=${{ github.ref == 'refs/heads/master' }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
+            # master push: also tag the upcoming release version (resolved by the version job).
+            type=raw,value=${{ needs.version.outputs.tag }},enable=${{ github.ref == 'refs/heads/master' }}
       - name: build (push only on master / v*)
         uses: docker/build-push-action@v6
         with:
@@ -230,3 +268,20 @@ jobs:
         run: |
           ssh -i ~/.ssh/id_deploy -p "${DEPLOY_PORT:-22}" -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts -o BatchMode=yes \
             "${DEPLOY_USER}@${DEPLOY_HOST}" "docker image prune -f"
+
+  release:
+    name: tag + release binaries (after production deploy)
+    needs: [version, deploy]
+    # Same gate as deploy: main repo master push only. The tag is created here
+    # (after deploy success) at the deployed commit — a GITHUB_TOKEN tag push
+    # would NOT retrigger workflows, hence the reusable-workflow call.
+    if: github.repository == 'ModerRAS/pi-host-ops-server' && github.ref == 'refs/heads/master' && github.event_name == 'push'
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    secrets: inherit
+    with:
+      tag: ${{ needs.version.outputs.tag }}
