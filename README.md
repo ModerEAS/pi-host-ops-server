@@ -37,6 +37,19 @@ cargo run --release
 # BIND default 0.0.0.0:8787
 ```
 
+## Docker / Swarm
+
+Only the **server** (dispatcher HTTP + SQLite) is containerized — image
+`ghcr.io/moderras/pi-host-ops-server` (`:latest` + `:sha-<commit>` on master).
+The worker stays host-installed (needs host `pi_svc` / project dirs).
+
+```bash
+docker compose up --build   # local: server on :8787, SQLite in a volume
+```
+
+Production Swarm deploy (GHCR pull + `docker stack deploy`, never build on the
+server): see [docs/deploy.md](docs/deploy.md).
+
 ## Create an agent + targeted jobs
 
 ```bash
