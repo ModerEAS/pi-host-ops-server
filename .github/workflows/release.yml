@@ -29,27 +29,32 @@ jobs:
             archive: tar.gz
             server: pi-host-ops-server-linux-x64
             worker: worker-linux-x64
+            host_ops: host-ops-linux-x64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
             server: pi-host-ops-server-windows-x64.exe
             worker: worker-windows-x64.exe
+            host_ops: host-ops-windows-x64.exe
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
             server: pi-host-ops-server-linux-arm64
             worker: worker-linux-arm64
+            host_ops: host-ops-linux-arm64
             cross: true
           - target: x86_64-apple-darwin
             os: macos-13
             archive: tar.gz
             server: pi-host-ops-server-darwin-x64
             worker: worker-darwin-x64
+            host_ops: host-ops-darwin-x64
           - target: aarch64-apple-darwin
             os: macos-14
             archive: tar.gz
             server: pi-host-ops-server-darwin-arm64
             worker: worker-darwin-arm64
+            host_ops: host-ops-darwin-arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -84,8 +89,9 @@ jobs:
           SRC="target/${{ matrix.target }}/release"
           cp "$SRC/pi-host-ops-server" "dist/${{ matrix.server }}"
           cp "$SRC/worker" "dist/${{ matrix.worker }}"
-          chmod +x "dist/${{ matrix.server }}" "dist/${{ matrix.worker }}"
-          (cd dist && sha256sum "${{ matrix.server }}" "${{ matrix.worker }}" > SHA256SUMS-${{ matrix.target }}.txt)
+          cp "$SRC/host-ops" "dist/${{ matrix.host_ops }}"
+          chmod +x "dist/${{ matrix.server }}" "dist/${{ matrix.worker }}" "dist/${{ matrix.host_ops }}"
+          (cd dist && sha256sum "${{ matrix.server }}" "${{ matrix.worker }}" "${{ matrix.host_ops }}" > SHA256SUMS-${{ matrix.target }}.txt)
           ls -la dist
 
       - name: Stage binaries (windows)
@@ -97,8 +103,9 @@ jobs:
           $src = "target/${{ matrix.target }}/release"
           Copy-Item "$src/pi-host-ops-server.exe" "dist/${{ matrix.server }}"
           Copy-Item "$src/worker.exe" "dist/${{ matrix.worker }}"
+          Copy-Item "$src/host-ops.exe" "dist/${{ matrix.host_ops }}"
           $hashes = @()
-          foreach ($f in @("${{ matrix.server }}", "${{ matrix.worker }}")) {
+          foreach ($f in @("${{ matrix.server }}", "${{ matrix.worker }}", "${{ matrix.host_ops }}")) {
             $h = (Get-FileHash -Algorithm SHA256 "dist/$f").Hash.ToLower()
             $hashes += "$h  $f"
           }
@@ -147,7 +154,7 @@ jobs:
           mkdir -p release-assets
           find artifacts -type f -print
           # download-artifact with merge-multiple puts files flat or nested; normalize
-          find artifacts -type f \( -name 'worker-*' -o -name 'pi-host-ops-server-*' -o -name 'SHA256SUMS-*' \) \
+          find artifacts -type f \( -name 'worker-*' -o -name 'pi-host-ops-server-*' -o -name 'host-ops-*' -o -name 'SHA256SUMS-*' \) \
             -exec cp -v {} release-assets/ \;
           cd release-assets
           cat SHA256SUMS-*.txt | sort > SHA256SUMS
@@ -172,6 +179,7 @@ jobs:
             | `worker-windows-x64.exe` | Windows x86_64 worker |
             | `worker-linux-arm64` | Linux aarch64 worker |
             | `worker-darwin-x64` / `worker-darwin-arm64` | macOS |
+            | `host-ops-*` | Dispatcher CLI (same platforms) |
             | `pi-host-ops-server-*` | Server binaries (same platforms) |
             | `SHA256SUMS` | Checksums |
 
@@ -190,9 +198,17 @@ jobs:
               --agent-token '<token>' --host-ops-url 'https://your-server:8787' --run
             ```
 
+            ### Install dispatcher CLI (host-ops)
+
+            ```bash
+            ./scripts/install-host-ops.sh --repo ModerRAS/pi-host-ops-server --version ${{ steps.tag.outputs.tag }}
+            host-ops config set --url 'https://your-server:8787' --token '<DISPATCHER_TOKEN>'
+            ```
+
             First release after merge: create a `v*` tag on `master` (or run this workflow with `tag` input).
           files: |
             release-assets/worker-*
+            release-assets/host-ops-*
             release-assets/pi-host-ops-server-*
             release-assets/SHA256SUMS
         env:

@@ -152,6 +152,40 @@ Statuses: `queued` | `running` | `succeeded` | `failed` | `timed_out` | `no_agen
 - `003_job_events` — incremental feedback
 - `004_agent_model` — per-agent `pi_provider` / `pi_model`
 
+
+## Dispatcher CLI (`host-ops`)
+
+调度端不要裸 `curl`：同一仓库提供 **`host-ops`** CLI（Bearer + JSON 封装）。
+
+配置（**不写进项目目录**）：
+
+- Linux/mac: `~/.config/pi-host-ops/dispatcher.json`
+- Windows: `%APPDATA%\pi-host-ops\dispatcher.json`
+- 字段: `url`（默认 `http://127.0.0.1:8787`）、`token`（`DISPATCHER_TOKEN`）
+- 环境变量覆盖（优先）: `HOST_OPS_URL`、`DISPATCHER_TOKEN`
+
+```bash
+cargo run --release --bin host-ops -- config set --url http://127.0.0.1:8787 --token "$DISPATCHER_TOKEN"
+# 或安装脚本（Release 后）:
+# ./scripts/install-host-ops.sh
+
+host-ops agents list
+host-ops agents create --id duolinzao-scale --label duolinzao --project duolinzao --cap shell
+
+# 创建任务（默认 delivery=steer）
+host-ops job create --type observe --payload '{"focus":"cwd"}' --agent duolinzao-scale --thread feature-x
+host-ops job watch <job-id>
+
+# 纠正 / 打断进行中的 Pi 会话：payload.prompt 几乎原样进 pi_svc send --steer
+host-ops steer --agent duolinzao-scale --thread feature-x --prompt '纠正：不要改 README，只修编译错误'
+# 或从已有 job 推断 agent/thread：
+host-ops job steer <job-uuid> --prompt-file ./correction.txt
+# job create 也支持 --prompt 简写 → {"prompt":"..."}
+host-ops job create --type act --prompt '继续完成剩余测试' --agent duolinzao-scale --delivery steer
+```
+
+Worker 侧：若 payload 含字符串字段 **`prompt`**（或 `message` / `text`），则发给 `pi_svc` 的正文就是该字符串（仅加一行 `[host-ops job <id>]` 前缀），不再包一整段 JSON boilerplate。
+
 ## Worker (embedded WebUI)
 
 One local **worker** process manages many project directories via a small WebUI.
@@ -174,7 +208,7 @@ See **[worker/README.md](worker/README.md)**.
 powershell -ExecutionPolicy Bypass -File scripts\install-worker.ps1 -Run
 ```
 
-Assets (after a `v*` tag / Release workflow): `worker-linux-x64`, `worker-windows-x64.exe`, `pi-host-ops-server-*`, `SHA256SUMS`.
+Assets (after a `v*` tag / Release workflow): `worker-*`, `host-ops-*`, `pi-host-ops-server-*`, `SHA256SUMS`.
 
 ### Dev only
 

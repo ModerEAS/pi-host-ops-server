@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::config::hash_token;
@@ -24,7 +25,9 @@ impl Db {
         let options = SqliteConnectOptions::from_str(database_url)
             .context("parse DATABASE_URL")?
             .create_if_missing(true)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -411,7 +414,9 @@ impl Db {
             return Ok(None);
         }
 
-        let mut tx = self.pool.begin().await?;
+        // IMMEDIATE: take the write lock up front so concurrent claims serialize
+        // instead of deadlocking on deferred SHARED→RESERVED upgrades (SQLITE_BUSY).
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let candidates = sqlx::query(
             r#"

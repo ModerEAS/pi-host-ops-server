@@ -1,15 +1,18 @@
 //! Concurrent claim atomicity with targeted jobs.
 use chrono::Utc;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::Row;
 use std::str::FromStr;
+use std::time::Duration;
 use uuid::Uuid;
 
 async fn setup_pool(path: &str) -> sqlx::SqlitePool {
     let options = SqliteConnectOptions::from_str(&format!("sqlite:{path}"))
         .unwrap()
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
         .max_connections(10)
         .connect_with(options)
@@ -33,7 +36,7 @@ async fn insert_queued(pool: &sqlx::SqlitePool, id: Uuid) {
 }
 
 async fn claim_one(pool: &sqlx::SqlitePool, agent: &str) -> Option<String> {
-    let mut tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
     let row = sqlx::query(
         "SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1",
     )
