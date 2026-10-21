@@ -1,13 +1,15 @@
 # host-ops worker（box 侧）
 
-Bridges `pi-host-ops-server` to local **`pi_svc`**. Per-agent Bearer token. Streams progress via `/events`.
+Rust binary that bridges `pi-host-ops-server` to local **`pi_svc`**. Per-agent Bearer token. Streams progress via `/events`.
+
+The previous Python worker (`host_ops_worker.py`) has been removed.
 
 ## Behavior
 
 1. `POST /v1/agent/heartbeat` on an interval
 2. `POST /v1/agent/poll` long-poll
 3. On job:
-   - **`shell`** + `payload.command` → local subprocess
+   - **`shell`** + `payload.command` → local `bash -c`
    - else → `pi_svc` with **`delivery_mode`**:
      - **`steer`** (server default) → `pi_svc send --steer`
      - **`queue`** + idle → `send`; + busy → `send --follow-up`
@@ -21,7 +23,7 @@ Bridges `pi-host-ops-server` to local **`pi_svc`**. Per-agent Bearer token. Stre
 |----------|---------|---------|
 | `HOST_OPS_URL` | `http://127.0.0.1:8787` | Server |
 | `AGENT_TOKEN` | *(required)* | This agent's token |
-| `AGENT_ID` | `box-pi` | Log label only (auth is token) |
+| `AGENT_ID` | `box-pi` | Log / `X-Agent-Id` label (auth is token) |
 | `PI_SVC` | `/workspace/pi-runs/pi_svc` | CLI |
 | `PI_SESSION` | `host-ops` | Session name |
 | `WORK_DIR` | `…/workspace` | cwd |
@@ -35,6 +37,11 @@ Bridges `pi-host-ops-server` to local **`pi_svc`**. Per-agent Bearer token. Stre
 ```bash
 # Create agent via dispatcher, then:
 export AGENT_TOKEN='<token from POST /v1/agents>'
+
+# Preferred:
+cargo run --release --bin worker
+
+# Or helper (loads .env / bootstrap-tokens.txt):
 ./worker/run.sh
 ```
 

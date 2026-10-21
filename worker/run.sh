@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the host-ops box worker (no systemd).
+# Start the host-ops box worker (Rust binary).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -13,7 +13,6 @@ if [[ -z "${AGENT_TOKEN:-}" ]]; then
   fi
 fi
 if [[ -z "${AGENT_TOKEN:-}" && -f data/bootstrap-tokens.txt ]]; then
-  # format: AGENT_TOKEN <value>  or KEY=value lines
   if grep -q '^AGENT_TOKEN=' data/bootstrap-tokens.txt 2>/dev/null; then
     AGENT_TOKEN="$(grep '^AGENT_TOKEN=' data/bootstrap-tokens.txt | head -1 | cut -d= -f2-)"
   else
@@ -35,4 +34,8 @@ export WORK_DIR="${WORK_DIR:-$ROOT/workspace}"
 export POLL_WAIT_SECS="${POLL_WAIT_SECS:-20}"
 
 mkdir -p "$WORK_DIR"
-exec python3 "$ROOT/worker/host_ops_worker.py"
+
+if [[ -x "$ROOT/target/release/worker" ]]; then
+  exec "$ROOT/target/release/worker"
+fi
+exec cargo run --release --bin worker

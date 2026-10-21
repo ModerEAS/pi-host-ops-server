@@ -153,11 +153,12 @@ Statuses: `queued` | `running` | `succeeded` | `failed` | `timed_out` | `no_agen
 
 ## Worker
 
-See **[worker/README.md](worker/README.md)**. Uses `AGENT_TOKEN` for the registered agent (often `default` or a token from `POST /v1/agents`).
+Rust binary (`cargo run --release --bin worker`). See **[worker/README.md](worker/README.md)**. Uses `AGENT_TOKEN` for the registered agent (often `default` or a token from `POST /v1/agents`).
 
 ```bash
-cargo run --release          # terminal A
-./worker/run.sh              # terminal B (reads bootstrap / .env)
+cargo run --release                   # terminal A — server
+cargo run --release --bin worker      # terminal B — worker
+# or: ./worker/run.sh                 # loads .env / bootstrap-tokens.txt
 ```
 
 ## Tests / smoke
