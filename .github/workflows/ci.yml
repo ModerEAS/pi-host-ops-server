@@ -89,7 +89,10 @@ jobs:
         run: |
           set -euo pipefail
           docker buildx build --load -t host-ops-smoke:ci --cache-from type=gha .
-          docker run -d --name host-ops-smoke -p 8787:8787 host-ops-smoke:ci
+          docker run -d --name host-ops-smoke -p 8787:8787 \
+            -e DISPATCHER_TOKEN=ci-smoke -e AGENT_TOKEN=ci-smoke-agent \
+            host-ops-smoke:ci
+          cleanup() { docker logs host-ops-smoke 2>/dev/null || true; docker rm -f host-ops-smoke >/dev/null 2>&1 || true; }
           for _ in $(seq 1 20); do
             if curl -fsS http://127.0.0.1:8787/health; then
               echo; echo HEALTHY
@@ -97,8 +100,12 @@ jobs:
             fi
             sleep 3
           done
-          curl -fsS http://127.0.0.1:8787/health | grep -q '"ok":true'
-          docker rm -f host-ops-smoke
+          if ! curl -fsS http://127.0.0.1:8787/health | grep -q '"ok":true'; then
+            echo "smoke FAILED — container logs:"
+            cleanup
+            exit 1
+          fi
+          cleanup
 
   deploy:
     name: deploy to Swarm (production)

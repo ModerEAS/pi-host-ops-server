@@ -17,8 +17,9 @@ RUN apt-get update \
 WORKDIR /app
 COPY LICENSE /app/LICENSE
 COPY --from=build /src/target/release/pi-host-ops-server /app/pi-host-ops-server
-# SQLite data dir: created here so the anonymous/named volume inherits ownership.
-RUN mkdir -p /data && chown 65534:65534 /data
+# SQLite data dir + app-relative bootstrap dir (config always ensures ./data
+# exists for bootstrap-tokens.txt): both nobody-owned before dropping root.
+RUN mkdir -p /data /app/data && chown 65534:65534 /data /app/data
 ENV BIND=0.0.0.0:8787
 ENV DATABASE_URL=sqlite:/data/host-ops.db
 EXPOSE 8787
