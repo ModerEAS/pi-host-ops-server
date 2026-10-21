@@ -125,7 +125,8 @@ Deploy condition: main repo (`ModerRAS/pi-host-ops-server`) + `refs/heads/master
 ## 3. Release flow (automatic)
 
 1. `test` green → `image` builds and pushes
-   `ghcr.io/moderras/pi-host-ops-server:sha-<commit>` (+ `latest`).
+   `ghcr.io/moderras/pi-host-ops-server:sha-<commit>` (+ `latest` +
+   the upcoming release tag `v<next>`).
 2. `deploy`: scp `stack.yml` to `DEPLOY_PATH`; inject
    `IMAGE_TAG`/`HOST_OPS_DOMAIN`/Traefik vars; then
    `docker stack deploy -c stack.yml --with-registry-auth host-ops`.
@@ -135,6 +136,21 @@ Deploy condition: main repo (`ModerRAS/pi-host-ops-server`) + `refs/heads/master
    `failure_action: rollback` already auto-rolled-back by Swarm).
 4. Runner `curl https://domain/health` with retries (5 min).
 5. `docker image prune -f` cleans old images.
+6. `release` (after deploy success): creates tag `v<next>` at the deployed
+   commit and publishes the GitHub Release (marked latest) with all
+   binaries — no manual tag pushing.
+
+### Tag scheme (`v<next>`)
+
+Resolved by the `version` job on every CI run (preview value on PRs,
+authoritative on master):
+
+- Latest semver tag `vX.Y.Z` → next is patch+1 (`vX.Y.(Z+1)`).
+- If `Cargo.toml` `[package] version` is **greater** than the latest tag,
+  it wins as-is — bump Cargo version to jump minor/major.
+- No tags yet → Cargo version.
+- The release build stamps the crate version to the tag (binaries'
+  `--version` matches); the stamp is never committed.
 
 ## 4. Rollback
 
@@ -174,7 +190,10 @@ is intentionally NOT in the container stack. Install it from GitHub Releases
 powershell -ExecutionPolicy Bypass -File scripts\install-worker.ps1 -Run
 ```
 
-Assets after a `v*` tag / Release workflow: `worker-*`, `host-ops-*`,
-`pi-host-ops-server-*`, `SHA256SUMS`. Point the worker at the deployed server
+Assets are auto-published after each successful production deploy
+(`v<next-patch>` scheme, marked latest): `worker-*`, `host-ops-*`,
+`pi-host-ops-server-*`, `SHA256SUMS`. To jump minor/major, bump
+`Cargo.toml` `[package] version` — it wins over the latest tag.
+Point the worker at the deployed server
 URL with the agent token. See [worker/README.md](../worker/README.md) and the
 top-level README "Run" section.

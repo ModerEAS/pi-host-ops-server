@@ -9,6 +9,13 @@ on:
         description: "Release tag to create/publish (e.g. v0.1.0). Leave empty to use the pushed tag."
         required: false
         default: ""
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.1). ci.yml passes the auto-bumped tag after a successful production deploy."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -44,13 +51,13 @@ jobs:
             host_ops: host-ops-linux-arm64
             cross: true
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15
             archive: tar.gz
             server: pi-host-ops-server-darwin-x64
             worker: worker-darwin-x64
             host_ops: host-ops-darwin-x64
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             archive: tar.gz
             server: pi-host-ops-server-darwin-arm64
             worker: worker-darwin-arm64
@@ -72,6 +79,38 @@ jobs:
         if: matrix.cross == true
         run: cargo install cross --locked
 
+      - name: Stamp crate version from tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.tag }}" ]; then TAG="${{ inputs.tag }}"; else TAG="${{ github.ref_name }}"; fi
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "refusing to stamp non-semver tag: $TAG" >&2; exit 1 ;;
+          esac
+          VER="${TAG#v}"
+          PY="$(command -v python3 || command -v python)"
+          "$PY" - "$VER" <<'EOF'
+          import re, sys
+          ver = sys.argv[1]
+          lines = open('Cargo.toml').read().splitlines(keepends=True)
+          out, in_pkg, done = [], False, False
+          for ln in lines:
+              if ln.startswith('['):
+                  in_pkg = ln.strip() == '[package]'
+              if in_pkg and not done and re.match(r'^version\s*=', ln):
+                  ln = f'version = "{ver}"\n'
+                  done = True
+              out.append(ln)
+          assert done, 'no [package] version found'
+          open('Cargo.toml', 'w').write(''.join(out))
+          lock = open('Cargo.lock').read()
+          new, cnt = re.subn(r'(name = "pi-host-ops-server"\nversion = ")[^"]*(")', lambda m: m.group(1) + ver + m.group(2), lock)
+          assert cnt == 1, f'expected 1 lock stanza, got {cnt}'
+          open('Cargo.lock', 'w').write(new)
+          print(f'stamped crate version {ver}')
+          EOF
+
       - name: Build (native)
         if: matrix.cross != true
         run: cargo build --locked --release --target ${{ matrix.target }} --bins
@@ -91,7 +130,12 @@ jobs:
           cp "$SRC/worker" "dist/${{ matrix.worker }}"
           cp "$SRC/host-ops" "dist/${{ matrix.host_ops }}"
           chmod +x "dist/${{ matrix.server }}" "dist/${{ matrix.worker }}" "dist/${{ matrix.host_ops }}"
-          (cd dist && sha256sum "${{ matrix.server }}" "${{ matrix.worker }}" "${{ matrix.host_ops }}" > SHA256SUMS-${{ matrix.target }}.txt)
+          # macOS runners lack sha256sum; shasum output format is compatible.
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${{ matrix.server }}" "${{ matrix.worker }}" "${{ matrix.host_ops }}" > SHA256SUMS-${{ matrix.target }}.txt)
+          else
+            (cd dist && shasum -a 256 "${{ matrix.server }}" "${{ matrix.worker }}" "${{ matrix.host_ops }}" > SHA256SUMS-${{ matrix.target }}.txt)
+          fi
           ls -la dist
 
       - name: Stage binaries (windows)
@@ -130,12 +174,12 @@ jobs:
         id: tag
         shell: bash
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.tag }}" ]]; then
+          if [ -n "${{ inputs.tag }}" ]; then
             TAG="${{ inputs.tag }}"
           elif [[ "${{ github.ref_type }}" == "tag" ]]; then
             TAG="${{ github.ref_name }}"
           else
-            echo "No tag: push a v* tag or pass workflow_dispatch.tag" >&2
+            echo "No tag: push a v* tag or pass tag input (workflow_dispatch / workflow_call)" >&2
             exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -165,6 +209,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
           name: ${{ steps.tag.outputs.tag }}
           draft: false
           generate_release_notes: true
@@ -205,7 +251,9 @@ jobs:
             host-ops config set --url 'https://your-server:8787' --token '<DISPATCHER_TOKEN>'
             ```
 
-            First release after merge: create a `v*` tag on `master` (or run this workflow with `tag` input).
+            Releases are auto-published after each successful production deploy
+            (`v<next-patch>` at the deployed commit, marked latest); manual
+            `workflow_dispatch` with a `tag` input still works.
           files: |
             release-assets/worker-*
             release-assets/host-ops-*

@@ -221,7 +221,10 @@ See **[worker/README.md](worker/README.md)**.
 powershell -ExecutionPolicy Bypass -File scripts\install-worker.ps1 -Run
 ```
 
-Assets (after a `v*` tag / Release workflow): `worker-*`, `host-ops-*`, `pi-host-ops-server-*`, `SHA256SUMS`.
+Assets are auto-published after each successful production deploy
+(`v<next-patch>` scheme, marked latest): `worker-*`, `host-ops-*`,
+`pi-host-ops-server-*`, `SHA256SUMS`. To jump minor/major, bump
+`Cargo.toml` `[package] version` — see [docs/deploy.md](docs/deploy.md) §3.
 
 ### Dev only
 
