@@ -29,6 +29,11 @@ use webui::{set_dir_status, AppState};
 const POLL_WAIT: u64 = 8;
 const HEARTBEAT_SECS: f64 = 20.0;
 const LOOP_TICK_MS: u64 = 500;
+/// Batch heartbeat cadence in multiplexed mode (must stay well under the
+/// server HEARTBEAT_TTL, default 45s).
+const WORKER_HEARTBEAT_SECS: f64 = 15.0;
+/// Single multiplexed long-poll wait (server caps at 25).
+const WORKER_POLL_WAIT: u64 = 20;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -92,10 +97,33 @@ async fn main() -> Result<()> {
     });
 
     let mut last_hb: std::collections::HashMap<String, Instant> = std::collections::HashMap::new();
+    // Background batch-heartbeat task while multiplexed mode is active.
+    let mut hb_task: Option<tokio::task::JoinHandle<()>> = None;
 
     while !stop.load(Ordering::Relaxed) {
         // Snapshot config each tick so WebUI edits apply without restart.
         let snapshot = state.cfg.lock().await.clone();
+        // Worker multiplexed mode: one batch heartbeat (background task) + one
+        // poll for all bound agents. Serial execution holds because
+        // execute_job blocks this loop — no second poll starts mid-job.
+        let mux = !snapshot.worker_token.trim().is_empty()
+            && snapshot.directories.iter().any(|d| d.enabled);
+        if mux {
+            if hb_task.is_none() {
+                info!("worker multiplexed mode: batch heartbeat + single poll");
+                hb_task = Some(spawn_worker_heartbeat_task(state.clone()));
+            }
+            if let Err(e) = run_worker_mux_step(&state, &snapshot, &stop).await {
+                warn!(error = %e, "worker mux step failed");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(LOOP_TICK_MS)).await;
+            continue;
+        }
+        if let Some(h) = hb_task.take() {
+            h.abort();
+            info!("worker token cleared: back to per-directory poll mode");
+        }
         for dir in snapshot.directories.iter().filter(|d| d.enabled) {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -238,6 +266,183 @@ async fn main() -> Result<()> {
     }
 
     info!("worker stopped");
+    Ok(())
+}
+
+/// Background batch heartbeat for multiplexed mode: every ~15s send one
+/// request covering all enabled + registered dirs, so siblings stay online
+/// (age << HEARTBEAT_TTL) even while one dir runs a long job.
+fn spawn_worker_heartbeat_task(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs_f64(WORKER_HEARTBEAT_SECS));
+        loop {
+            tick.tick().await;
+            let snapshot = state.cfg.lock().await.clone();
+            let token = snapshot.worker_token.clone();
+            if token.trim().is_empty() {
+                continue;
+            }
+            let statuses = state.status.lock().await.directories.clone();
+            let mut agents: Vec<(String, String)> = Vec::new();
+            for dir in snapshot.directories.iter().filter(|d| d.enabled) {
+                let (Some(aid), Some(_)) =
+                    (dir.agent_id.clone(), dir.agent_token.clone())
+                else {
+                    continue;
+                };
+                if aid.trim().is_empty() {
+                    continue;
+                }
+                let st = statuses
+                    .get(&dir.id)
+                    .map(|s| s.state.as_str())
+                    .unwrap_or("online");
+                agents.push((
+                    aid,
+                    if st == "busy" { "busy".into() } else { "online".into() },
+                ));
+            }
+            if agents.is_empty() {
+                continue;
+            }
+            match ApiClient::with_worker(&snapshot.host_ops_url, &token) {
+                Ok(api) => api.worker_heartbeat(&agents).await,
+                Err(e) => warn!(error = %e, "worker heartbeat client"),
+            }
+        }
+    })
+}
+
+/// One multiplexed step: register dirs (as today), then a single poll for
+/// any bound agent; dispatch a claimed job to its directory and run it with
+/// that agent's token (results/events/lease stay per-agent).
+async fn run_worker_mux_step(
+    state: &Arc<AppState>,
+    snapshot: &WorkerConfig,
+    stop: &AtomicBool,
+) -> Result<()> {
+    let mut registered: Vec<(DirEntry, String, String)> = Vec::new();
+    for dir in snapshot.directories.iter().filter(|d| d.enabled) {
+        if let Err(e) = reject_fast(&dir.provider, &dir.model) {
+            set_dir_status(
+                state,
+                &dir.id,
+                DirStatus {
+                    state: "error".into(),
+                    last_error: Some(e.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            continue;
+        }
+        match ensure_registered(state, snapshot, dir).await {
+            Ok((agent_id, agent_token, entry)) => {
+                set_dir_status(
+                    state,
+                    &dir.id,
+                    DirStatus {
+                        state: "online".into(),
+                        agent_id: Some(agent_id.clone()),
+                        last_error: None,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                registered.push((entry, agent_id, agent_token));
+            }
+            Err(e) => {
+                set_dir_status(
+                    state,
+                    &dir.id,
+                    DirStatus {
+                        state: "needs_bootstrap".into(),
+                        last_error: Some(e.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            }
+        }
+    }
+    if registered.is_empty() {
+        return Ok(());
+    }
+
+    let worker_api = ApiClient::with_worker(&snapshot.host_ops_url, &snapshot.worker_token)?;
+    match worker_api.worker_poll(WORKER_POLL_WAIT).await {
+        Ok(None) => {}
+        Ok(Some((job, agent_id))) => {
+            let Some((entry, _, agent_token)) =
+                registered.iter().find(|(_, aid, _)| aid == &agent_id)
+            else {
+                // Bound on the server but no local dir (removed/disabled after
+                // bind): can't run it here; the lease will reap it. Unbind the
+                // agent or re-enable the dir to fix.
+                warn!(%agent_id, job = %job.id, "claimed job for unknown local dir; leaving for lease expiry");
+                return Ok(());
+            };
+            // Find dir id for status updates.
+            let dir_id = snapshot
+                .directories
+                .iter()
+                .find(|d| d.agent_id.as_deref() == Some(agent_id.as_str()))
+                .map(|d| d.id.clone())
+                .unwrap_or_default();
+            set_dir_status(
+                state,
+                &dir_id,
+                DirStatus {
+                    state: "busy".into(),
+                    last_job_id: Some(job.id.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let api = ApiClient::new(&snapshot.host_ops_url, agent_token, &agent_id)?;
+            let pi_svc = snapshot
+                .pi_svc
+                .as_ref()
+                .map(PathBuf::from)
+                .filter(|p| !p.as_os_str().is_empty());
+            let session = entry
+                .pi_session
+                .clone()
+                .unwrap_or_else(|| default_session_for(&entry.label, &entry.id));
+            let rt = DirRuntime {
+                host_ops_url: snapshot.host_ops_url.clone(),
+                agent_token: agent_token.clone(),
+                agent_id: agent_id.clone(),
+                work_dir: PathBuf::from(&entry.path),
+                pi_svc,
+                pi_session: session,
+                provider: entry.provider.clone(),
+                model: entry.model.clone(),
+                event_interval_secs: 5.0,
+            };
+            let (ok, result, error) = runtime::execute_job(&api, &rt, &job, stop).await;
+            if let Err(e) = api
+                .submit_result(&job.id.to_string(), ok, result, error.clone())
+                .await
+            {
+                error!(error = %e, "submit_result");
+            }
+            set_dir_status(
+                state,
+                &dir_id,
+                DirStatus {
+                    state: if ok { "online".into() } else { "error".into() },
+                    last_error: error,
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+        Err(e) => {
+            warn!(error = %e, "worker poll failed");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
     Ok(())
 }
 

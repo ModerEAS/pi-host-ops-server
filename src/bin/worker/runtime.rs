@@ -113,6 +113,10 @@ impl ApiClient {
         Self::new(host_ops_url, dispatcher_token, "dispatcher")
     }
 
+    pub fn with_worker(host_ops_url: &str, worker_token: &str) -> Result<Self> {
+        Self::new(host_ops_url, worker_token, "worker")
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.host_ops_url, path)
     }
@@ -213,6 +217,23 @@ impl ApiClient {
             .await;
     }
 
+    /// Batch heartbeat for all agents bound to this worker (worker token).
+    /// `agents`: (agent_id, status) pairs.
+    pub async fn worker_heartbeat(&self, agents: &[(String, String)]) {
+        let list: Vec<Value> = agents
+            .iter()
+            .map(|(id, status)| json!({"agent_id": id, "status": status}))
+            .collect();
+        let _ = self
+            .request(
+                reqwest::Method::POST,
+                "/v1/worker/heartbeat",
+                Some(json!({"agents": list})),
+                15,
+            )
+            .await;
+    }
+
     pub async fn post_event(&self, job_id: &str, event_type: &str, message: Option<&str>, data: Option<Value>) {
         if job_id.is_empty() {
             return;
@@ -264,6 +285,34 @@ impl ApiClient {
         let job_v = body.get("job").cloned().unwrap_or(body);
         let job: Job = serde_json::from_value(job_v).context("decode job")?;
         Ok(Some(job))
+    }
+
+    /// Multiplexed poll (worker token): claims a job for any bound online
+    /// agent. Returns the job plus the agent_id to dispatch it to.
+    pub async fn worker_poll(&self, wait_secs: u64) -> Result<Option<(Job, String)>> {
+        let (status, body) = self
+            .request(
+                reqwest::Method::POST,
+                "/v1/worker/poll",
+                Some(json!({"wait_secs": wait_secs})),
+                wait_secs + 15,
+            )
+            .await?;
+        if status == 204 || body.is_none() {
+            return Ok(None);
+        }
+        if !(200..300).contains(&status) {
+            bail!("worker poll HTTP {status}: {body:?}");
+        }
+        let body = body.unwrap();
+        let agent_id = body
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .context("worker poll missing agent_id")?
+            .to_string();
+        let job_v = body.get("job").cloned().unwrap_or(body);
+        let job: Job = serde_json::from_value(job_v).context("decode job")?;
+        Ok(Some((job, agent_id)))
     }
 
     pub async fn submit_result(
