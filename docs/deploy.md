@@ -7,7 +7,7 @@ to the manager and runs `docker stack deploy` (start-first, auto-rollback).
 **Never build on the server — pull GHCR only.**
 
 Only the server is containerized. The **worker stays host-installed** (it needs
-host `pi_svc` / project dirs) via Release scripts — see §6.
+host `pi` binary / project dirs) via Release scripts — see §6.
 
 This repo is public: domain, entrypoint, certresolver, network name, and deploy
 path are all variables (see `deploy/stack.yml` header). No private hostnames
@@ -181,7 +181,7 @@ DB file on host: `DEPLOY_PATH/host-ops.db`. Backup:
 
 ## 6. Worker stays on the host
 
-The worker (WebUI + `pi_svc` pollers, one process managing many project dirs)
+The worker (WebUI + owned `pi --mode rpc` children, one process managing many project dirs)
 is intentionally NOT in the container stack. Install it from GitHub Releases
 (no cargo on the machine):
 

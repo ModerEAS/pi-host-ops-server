@@ -1,15 +1,20 @@
-//! Job execution: local shell + optional pi_svc.
-use std::path::{Path, PathBuf};
+//! Job execution: local shell + owned `pi --mode rpc` children (no pi_svc).
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
+use tokio::sync::{oneshot, Mutex};
 use tokio::process::Command;
 use tokio::time::{sleep, timeout};
-use tracing::{info, warn};
+use tracing::info;
 use uuid::Uuid;
 
 use crate::config::{reject_fast, DEFAULT_MODEL, DEFAULT_PROVIDER};
@@ -34,7 +39,8 @@ pub struct DirRuntime {
     pub agent_token: String,
     pub agent_id: String,
     pub work_dir: PathBuf,
-    pub pi_svc: Option<PathBuf>,
+    /// Optional pi binary path (default: `pi` from PATH).
+    pub pi_bin: Option<PathBuf>,
     pub pi_session: String,
     pub provider: String,
     pub model: String,
@@ -355,112 +361,483 @@ pub struct Job {
     pub delivery_mode: Option<String>,
 }
 
-struct CmdOut {
-    code: i32,
-    stdout: String,
-    stderr: String,
+// ── Direct `pi --mode rpc` sessions (no pi_svc) ──────────────────────────
+// One long-lived child per directory, owned by the worker. Liveness is the
+// OS process itself (`try_wait`); no status/list round-trips. Protocol
+// mirrors /workspace/pi-runs/svc/pi_svcd.py (reference only, not vendored).
+
+/// In-memory session state, fed by the stdout drain (replaces status.json).
+/// Counters mirror pi_svcd.py's status.json for future debugging.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct PiState {
+    pub state: String, // starting|idle|running|error|dead|stopped
+    pub settled_count: i64,
+    pub agent_starts: i64,
+    pub tool_count: i64,
+    pub last_tool: Option<String>,
+    pub last_event: Option<String>,
+    text_buf: String, // recent assistant text, capped
+    pub error: Option<String>,
+    pub ui_dialogs: u64,
 }
 
-async fn run_cmd(argv: &[String], timeout_secs: Option<f64>, cwd: Option<&Path>) -> CmdOut {
-    if argv.is_empty() {
-        return CmdOut { code: 1, stdout: String::new(), stderr: "empty argv".into() };
+impl PiState {
+    /// Last 4000 chars of assistant text.
+    pub fn text_tail(&self) -> String {
+        tail_chars(&self.text_buf, 4000)
     }
-    let mut cmd = Command::new(&argv[0]);
-    if argv.len() > 1 {
-        cmd.args(&argv[1..]);
+    /// Capped text history; result `text_log_tail` slices this further.
+    pub fn text_log(&self) -> &str {
+        &self.text_buf
     }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-    if let Some(c) = cwd {
-        cmd.current_dir(c);
-    }
-    let fut = async {
-        match cmd.output().await {
-            Ok(o) => CmdOut {
-                code: o.status.code().unwrap_or(1),
-                stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
-            },
-            Err(e) => CmdOut { code: 1, stdout: String::new(), stderr: e.to_string() },
+    fn push_text(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
         }
-    };
-    match timeout_secs {
-        Some(t) => match timeout(Duration::from_secs_f64(t), fut).await {
-            Ok(o) => o,
-            Err(_) => CmdOut { code: 124, stdout: String::new(), stderr: format!("timed out after {t}s") },
-        },
-        None => fut.await,
-    }
-}
-
-async fn pi_svc(rt: &DirRuntime, args: &[&str], timeout_secs: f64) -> CmdOut {
-    let Some(ref bin) = rt.pi_svc else {
-        return CmdOut { code: 127, stdout: String::new(), stderr: "PI_SVC not configured".into() };
-    };
-    let mut argv = vec![bin.display().to_string()];
-    argv.extend(args.iter().map(|s| (*s).to_string()));
-    run_cmd(&argv, Some(timeout_secs), None).await
-}
-
-async fn session_running(rt: &DirRuntime) -> bool {
-    let out = pi_svc(rt, &["list"], 30.0).await;
-    if out.code != 0 {
-        return false;
-    }
-    let Ok(sessions) = serde_json::from_str::<Value>(&out.stdout) else { return false };
-    let Some(arr) = sessions.as_array() else { return false };
-    for s in arr {
-        if s.get("name").and_then(|v| v.as_str()) == Some(rt.pi_session.as_str()) {
-            return s.get("running").and_then(|v| v.as_bool()).unwrap_or(false);
+        self.text_buf.push_str(delta);
+        const CAP: usize = 32768;
+        if self.text_buf.len() > CAP {
+            let mut idx = self.text_buf.len() - CAP;
+            while idx < self.text_buf.len() && !self.text_buf.is_char_boundary(idx) {
+                idx += 1;
+            }
+            self.text_buf.drain(..idx);
         }
     }
-    false
 }
 
-fn status_inner(st: &Value) -> &Value {
-    st.get("status").filter(|v| v.is_object()).unwrap_or(st)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpawnParams {
+    bin: String,
+    work_dir: PathBuf,
+    session: String,
+    provider: String,
+    model: String,
 }
 
-async fn get_status(rt: &DirRuntime) -> Option<Value> {
-    let out = pi_svc(rt, &["status", &rt.pi_session], 30.0).await;
-    if out.code != 0 {
-        return None;
-    }
-    match serde_json::from_str::<Value>(&out.stdout) {
-        Ok(v) => Some(v),
-        Err(_) => Some(json!({"raw": out.stdout})),
+fn spawn_params(rt: &DirRuntime) -> SpawnParams {
+    SpawnParams {
+        bin: rt
+            .pi_bin
+            .clone()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "pi".into()),
+        work_dir: rt.work_dir.clone(),
+        session: rt.pi_session.clone(),
+        provider: rt.provider.clone(),
+        model: rt.model.clone(),
     }
 }
 
-async fn ensure_session(rt: &DirRuntime) -> Result<()> {
-    rt.validate_model()?;
-    if session_running(rt).await {
-        info!(session = %rt.pi_session, "reusing pi_svc session");
-        return Ok(());
+/// Liveness of the owned child. `try_wait` is the source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildAlive {
+    Running,
+    Exited(Option<i32>),
+}
+
+fn classify_wait(res: std::io::Result<Option<std::process::ExitStatus>>) -> ChildAlive {
+    match res {
+        Ok(None) => ChildAlive::Running,
+        Ok(Some(status)) => ChildAlive::Exited(status.code()),
+        Err(_) => ChildAlive::Exited(None),
     }
-    let cwd = rt.work_dir.display().to_string();
-    let out = pi_svc(
-        rt,
-        &[
-            "start", &rt.pi_session, "--cwd", &cwd,
-            "--provider", &rt.provider, "--model", &rt.model,
-        ],
-        120.0,
-    ).await;
-    if out.code != 0 {
-        let msg = if out.stderr.is_empty() { out.stdout } else { out.stderr };
-        bail!("pi_svc start failed ({}): {msg}", out.code);
+}
+
+#[derive(Debug, Clone, Default)]
+struct PromptAccept {
+    success: bool,
+    disposition: Option<String>,
+    error: Option<String>,
+}
+
+impl PromptAccept {
+    /// The drain routes only records carrying this prompt's id here.
+    fn from_response(rec: &Value) -> Self {
+        Self {
+            success: rec.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+            disposition: rec
+                .get("data")
+                .and_then(|d| d.get("disposition"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            error: rec
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        }
     }
-    for _ in 0..30 {
-        if let Some(st) = get_status(rt).await {
-            let state = status_inner(&st).get("state").and_then(|v| v.as_str()).unwrap_or("");
-            if matches!(state, "idle" | "running") {
-                return Ok(());
+}
+
+/// Fold one RPC stdout record into session state (pure; unit-tested).
+/// Appends unattended `extension_ui_response` replies to `outbox`.
+fn apply_record(st: &mut PiState, rec: &Value, outbox: &mut Vec<Value>) {
+    let t = rec.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    st.last_event = if t.is_empty() { None } else { Some(t.to_string()) };
+    match t {
+        "response" if rec.get("command").and_then(|v| v.as_str()) == Some("prompt") => {
+            let ok = rec.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+            let disp = rec
+                .get("data")
+                .and_then(|d| d.get("disposition"))
+                .and_then(|v| v.as_str());
+            if ok && disp == Some("handled") {
+                // Synchronously completed: counts as settled, already idle.
+                st.settled_count += 1;
+                st.state = "idle".into();
+                st.error = None;
+            } else if ok {
+                st.state = "running".into();
+                st.error = None;
+            } else {
+                st.error = Some(
+                    rec.get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("prompt rejected")
+                        .to_string(),
+                );
             }
         }
-        sleep(Duration::from_millis(500)).await;
+        "agent_start" => {
+            st.agent_starts += 1;
+            st.state = "running".into();
+        }
+        "agent_settled" => {
+            st.settled_count += 1;
+            st.state = "idle".into();
+        }
+        "message_update" => {
+            // Only text deltas extend the tail (mirror pi_svcd).
+            let ev = rec.get("assistantMessageEvent");
+            if ev.and_then(|e| e.get("type")).and_then(|v| v.as_str()) == Some("text_delta") {
+                st.push_text(ev.and_then(|e| e.get("delta")).and_then(|v| v.as_str()).unwrap_or(""));
+            }
+        }
+        "tool_execution_start" => {
+            st.tool_count += 1;
+            if let Some(name) = rec.get("toolName").and_then(|v| v.as_str()) {
+                st.last_tool = Some(name.to_string());
+            }
+            st.state = "running".into();
+        }
+        "extension_ui_request" => {
+            if let Some(reply) = ui_auto_reply(rec) {
+                st.ui_dialogs += 1;
+                outbox.push(reply);
+            }
+        }
+        "error" => {
+            st.error = Some(rec.to_string().chars().take(1000).collect());
+            st.state = "error".into();
+        }
+        _ => {}
     }
-    warn!(session = %rt.pi_session, "pi_svc session start slow; continuing");
-    Ok(())
+}
+
+/// Unattended answers for Pi UI dialogs (mirror pi_svcd defaults).
+/// Fire-and-forget methods (setStatus/notify/...) need no reply → None.
+fn ui_auto_reply(rec: &Value) -> Option<Value> {
+    let req_id = rec.get("id").and_then(|v| v.as_str())?;
+    match rec.get("method").and_then(|v| v.as_str())? {
+        "confirm" => Some(json!({"type": "extension_ui_response", "id": req_id, "confirmed": true})),
+        "select" => {
+            let first = rec
+                .get("options")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .cloned()
+                .unwrap_or(Value::Null);
+            Some(json!({"type": "extension_ui_response", "id": req_id, "value": first}))
+        }
+        "input" => Some(json!({"type": "extension_ui_response", "id": req_id, "value": ""})),
+        "editor" => Some(json!({"type": "extension_ui_response", "id": req_id, "cancelled": true})),
+        _ => None,
+    }
+}
+
+/// One owned `pi --mode rpc` child + its stdout/stderr drains.
+/// Never held across awaits by callers: snapshot/clone out, or lock briefly.
+pub struct PiSession {
+    params: SpawnParams,
+    state: Mutex<PiState>,
+    child: Mutex<Child>,
+    stdin: Mutex<Option<ChildStdin>>,
+    pending: Mutex<HashMap<String, oneshot::Sender<Value>>>,
+    stderr_tail: Mutex<String>,
+}
+
+impl PiSession {
+    async fn spawn(rt: &DirRuntime) -> Result<Arc<Self>> {
+        rt.validate_model()?;
+        let params = spawn_params(rt);
+        let mut cmd = Command::new(&params.bin);
+        cmd.arg("--mode")
+            .arg("rpc")
+            .arg("--provider")
+            .arg(&params.provider)
+            .arg("--model")
+            .arg(&params.model)
+            .arg("--name")
+            .arg(&params.session)
+            .arg("--approve")
+            .current_dir(&params.work_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().with_context(|| format!("spawn {}", params.bin))?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take().context("pi stdout")?;
+        let stderr = child.stderr.take().context("pi stderr")?;
+        let sess = Arc::new(Self {
+            params,
+            state: Mutex::new(PiState { state: "starting".into(), ..Default::default() }),
+            child: Mutex::new(child),
+            stdin: Mutex::new(stdin),
+            pending: Mutex::new(HashMap::new()),
+            stderr_tail: Mutex::new(String::new()),
+        });
+        let s = sess.clone();
+        tokio::spawn(async move { s.drain_stdout(stdout).await });
+        let s = sess.clone();
+        tokio::spawn(async move { s.drain_stderr(stderr).await });
+        // Brief settle so the session loads; fail fast if it exits at once.
+        sleep(Duration::from_millis(800)).await;
+        if let ChildAlive::Exited(code) = sess.check().await {
+            let tail = sess.stderr_tail.lock().await.clone();
+            bail!("pi exited immediately code={code:?}: {}", tail_chars(&tail, 1000));
+        }
+        Ok(sess)
+    }
+
+    async fn drain_stdout(self: Arc<Self>, stdout: ChildStdout) {
+        let mut lines = BufReader::new(stdout).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    self.on_line(&line).await;
+                }
+                _ => break, // EOF or read error: child gone
+            }
+        }
+        self.mark_dead("pi stdout closed").await;
+    }
+
+    async fn drain_stderr(self: Arc<Self>, mut stderr: ChildStderr) {
+        let mut buf = [0u8; 4096];
+        loop {
+            match stderr.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let s = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let mut tail = self.stderr_tail.lock().await;
+                    tail.push_str(&s);
+                    const CAP: usize = 8192;
+                    if tail.len() > CAP {
+                        let mut idx = tail.len() - CAP;
+                        while idx < tail.len() && !tail.is_char_boundary(idx) {
+                            idx += 1;
+                        }
+                        tail.drain(..idx);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    async fn on_line(&self, line: &str) {
+        let rec: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::debug!(preview = %clip_chars(line, 200), "pi rpc: skip non-JSON line");
+                return;
+            }
+        };
+        // Fold into state first so prompt waiters observe post-accept state.
+        let mut outbox = Vec::new();
+        {
+            let mut st = self.state.lock().await;
+            apply_record(&mut st, &rec, &mut outbox);
+        }
+        for reply in outbox {
+            if self.write_json(&reply).await.is_err() {
+                let mut st = self.state.lock().await;
+                st.error = Some("ui_response write failed: pi stdin closed".into());
+                break;
+            }
+        }
+        if let Some(rid) = rec.get("id").and_then(|v| v.as_str()) {
+            if let Some(tx) = self.pending.lock().await.remove(rid) {
+                let _ = tx.send(rec);
+            }
+        }
+    }
+
+    async fn mark_dead(&self, why: &str) {
+        // Never overwrite a clean stop.
+        {
+            let mut st = self.state.lock().await;
+            if st.state != "stopped" && st.state != "dead" {
+                st.state = "dead".into();
+                if st.error.is_none() {
+                    st.error = Some(format!("{why} (pi child gone)"));
+                }
+            }
+        }
+        // Wake prompt waiters so sends fail instead of hanging.
+        let mut pending = self.pending.lock().await;
+        for (_, tx) in pending.drain() {
+            let _ = tx.send(json!({"type": "response", "success": false, "error": "pi child exited"}));
+        }
+    }
+
+    async fn write_json(&self, v: &Value) -> Result<()> {
+        let raw = serde_json::to_vec(v)?;
+        let mut g = self.stdin.lock().await;
+        let stdin = g.as_mut().context("pi stdin closed")?;
+        stdin.write_all(&raw).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
+    async fn check(&self) -> ChildAlive {
+        classify_wait(self.child.lock().await.try_wait())
+    }
+
+    /// Liveness source of truth: the OS process itself.
+    pub async fn is_alive(&self) -> bool {
+        matches!(self.check().await, ChildAlive::Running)
+    }
+
+    pub async fn snapshot(&self) -> PiState {
+        self.state.lock().await.clone()
+    }
+
+    fn matches(&self, rt: &DirRuntime) -> bool {
+        self.params == spawn_params(rt)
+    }
+
+    /// Send one prompt; resolves when pi accepts (not when the agent settles).
+    /// `behavior`: `steer` interrupts the current turn, `followUp` queues.
+    async fn send_prompt(
+        &self,
+        id: &str,
+        message: &str,
+        behavior: Option<&str>,
+    ) -> Result<PromptAccept> {
+        if !self.is_alive().await {
+            bail!("pi child not running");
+        }
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id.to_string(), tx);
+        let mut obj = json!({"id": id, "type": "prompt", "message": message});
+        if let Some(b) = behavior {
+            obj["streamingBehavior"] = json!(b);
+        }
+        if let Err(e) = self.write_json(&obj).await {
+            self.pending.lock().await.remove(id);
+            bail!("write prompt to pi: {e:#}");
+        }
+        match timeout(Duration::from_secs(60), rx).await {
+            Ok(Ok(rec)) => Ok(PromptAccept::from_response(&rec)),
+            Ok(Err(_)) => bail!("pi child exited while waiting for prompt accept"),
+            Err(_) => {
+                self.pending.lock().await.remove(id);
+                bail!("timeout waiting for pi prompt accept");
+            }
+        }
+    }
+
+    /// Clean shutdown: ask politely, close stdin, wait briefly, then kill.
+    /// Idempotent (second call reaps instantly).
+    pub async fn shutdown(&self) {
+        let _ = self.write_json(&json!({"type": "shutdown"})).await;
+        self.stdin.lock().await.take(); // EOF for a deaf child
+        let mut child = self.child.lock().await;
+        if tokio::time::timeout(Duration::from_secs(10), child.wait()).await.is_err() {
+            let _ = child.kill().await;
+        }
+        self.state.lock().await.state = "stopped".into();
+    }
+}
+
+/// Owned long-lived `pi --mode rpc` children, keyed by session name.
+#[derive(Default)]
+pub struct PiSessions {
+    inner: Mutex<HashMap<String, Arc<PiSession>>>,
+}
+
+impl PiSessions {
+    /// Live child for this dir: reuse when params match and the process runs,
+    /// else shut down the stale one and spawn fresh. Never fakes liveness.
+    pub async fn ensure(&self, rt: &DirRuntime) -> Result<Arc<PiSession>> {
+        // Bind first: the map guard must not be held across the awaits below
+        // (tokio Mutex is not reentrant).
+        let cached = { self.inner.lock().await.get(&rt.pi_session).cloned() };
+        if let Some(s) = cached {
+            if s.matches(rt) && s.is_alive().await {
+                return Ok(s);
+            }
+            s.shutdown().await;
+            self.inner.lock().await.remove(&rt.pi_session);
+        }
+        let s = PiSession::spawn(rt).await?;
+        self.inner.lock().await.insert(rt.pi_session.clone(), s.clone());
+        Ok(s)
+    }
+
+    /// None = never started; Some(true) = process running; Some(false) = exited.
+    pub async fn probe(&self, name: &str) -> Option<bool> {
+        let cached = { self.inner.lock().await.get(name).cloned() };
+        match cached {
+            Some(s) => Some(s.is_alive().await),
+            None => None,
+        }
+    }
+
+    /// Drop sessions for removed/disabled/renamed dirs (clean shutdown).
+    pub async fn retain_active(&self, names: &std::collections::HashSet<String>) {
+        let stale: Vec<Arc<PiSession>> = {
+            let inner = self.inner.lock().await;
+            inner
+                .iter()
+                .filter(|(k, _)| !names.contains(*k))
+                .map(|(_, s)| s.clone())
+                .collect()
+        };
+        if stale.is_empty() {
+            return;
+        }
+        let mut handles = Vec::with_capacity(stale.len());
+        for s in &stale {
+            let c = s.clone();
+            handles.push(tokio::spawn(async move { c.shutdown().await }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+        self.inner.lock().await.retain(|k, _| names.contains(k));
+    }
+
+    /// Terminate all children cleanly (worker shutdown path).
+    pub async fn shutdown_all(&self) {
+        let all: Vec<Arc<PiSession>> = self.inner.lock().await.values().cloned().collect();
+        let mut handles = Vec::with_capacity(all.len());
+        for s in &all {
+            let c = s.clone();
+            handles.push(tokio::spawn(async move { c.shutdown().await }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+        self.inner.lock().await.clear();
+    }
 }
 
 fn payload_prompt_text(payload: &Value) -> Option<String> {
@@ -475,7 +852,7 @@ fn payload_prompt_text(payload: &Value) -> Option<String> {
     None
 }
 
-/// Build text sent to `pi_svc send [--steer] --file`.
+/// Build text sent as the RPC prompt message.
 /// When payload has `prompt` / `message` / `text`, send that string nearly as-is
 /// (one-line job_id prefix only) — used by `host-ops steer` corrections.
 /// Otherwise wrap the full job JSON in the legacy boilerplate template.
@@ -501,20 +878,12 @@ struct PiProgress {
 }
 
 impl PiProgress {
-    fn from_status(st: &Value) -> Self {
-        let inner = status_inner(st);
+    fn from_state(s: &PiState) -> Self {
         Self {
-            running: inner.get("state").and_then(|v| v.as_str()) == Some("running"),
-            settled_count: inner.get("settled_count").and_then(|v| v.as_i64()),
-            last_tool: inner
-                .get("last_tool")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            text_tail: inner
-                .get("text_tail")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
+            running: s.state == "running",
+            settled_count: Some(s.settled_count),
+            last_tool: s.last_tool.clone(),
+            text_tail: s.text_tail(),
         }
     }
 
@@ -565,32 +934,30 @@ fn decide_wait(
 }
 
 struct WaitOutcome {
-    status: Value,
+    status: PiState,
     end: WaitEnd,
     saw_running: bool,
 }
 
-/// Activity-based wait for the Pi session to go idle after send.
-///
-/// Two budgets: an absolute cap (`abs_timeout_secs`, default 1h or the job's
-/// `timeout_secs`) and an inactivity budget (`inactivity_secs`, default 10min
-/// with no observable progress). While the agent is `running` or its
-/// `text_tail` / `last_tool` / `settled_count` keeps changing, the inactivity
-/// deadline keeps refreshing — a long coding run is never failed just for
-/// being slow. Lease renewals + progress events continue as today.
+/// Activity-based wait for the Pi session to go idle after the prompt is
+/// accepted. Same two budgets as before (absolute cap + inactivity budget
+/// refreshed by observable progress). Progress now comes from the owned
+/// child's in-memory state, and a dead child ends the wait as a failure —
+/// never as idle success. Lease renewals + progress events continue as today.
 async fn wait_until_idle_with_events(
     api: &ApiClient,
-    rt: &DirRuntime,
+    sess: &PiSession,
     job_id: &str,
     abs_timeout_secs: f64,
     inactivity_secs: f64,
+    event_interval_secs: f64,
     settled_before: Option<i64>,
     stop: &AtomicBool,
 ) -> WaitOutcome {
     let start = Instant::now();
     let mut last_progress_at = start;
     let mut prev = PiProgress::default();
-    let mut last = json!({});
+    let mut last = PiState { state: "starting".into(), ..Default::default() };
     let mut saw_running = false;
     let mut last_event_at = Instant::now() - Duration::from_secs(3600);
     let mut last_tail = String::new();
@@ -600,14 +967,19 @@ async fn wait_until_idle_with_events(
         if stop.load(Ordering::Relaxed) {
             return WaitOutcome { status: last, end: WaitEnd::Stopped, saw_running };
         }
-        let st = get_status(rt).await.unwrap_or_else(|| json!({}));
-        last = st.clone();
-        let inner = status_inner(&st);
-        let state = inner.get("state").and_then(|v| v.as_str());
-        let settled = inner.get("settled_count").and_then(|v| v.as_i64());
-        let tool = inner.get("last_tool").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let text_tail = inner.get("text_tail").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let cur = PiProgress::from_status(&st);
+        // The OS process is the source of truth: a dead child ends the wait
+        // as a failure even if the last snapshot looked healthy.
+        let alive = sess.check().await;
+        let mut cur_state = sess.snapshot().await;
+        if let ChildAlive::Exited(code) = alive {
+            if cur_state.state != "stopped" {
+                cur_state.state = "dead".into();
+            }
+            if cur_state.error.is_none() {
+                cur_state.error = Some(format!("pi child exited code={code:?}"));
+            }
+        }
+        let cur = PiProgress::from_state(&cur_state);
         if cur.running {
             saw_running = true;
         }
@@ -616,7 +988,10 @@ async fn wait_until_idle_with_events(
             last_progress_at = now;
         }
         prev = cur;
-        if now.duration_since(last_event_at).as_secs_f64() >= rt.event_interval_secs {
+        last = cur_state;
+        let tool = last.last_tool.clone();
+        let text_tail = last.text_tail();
+        if now.duration_since(last_event_at).as_secs_f64() >= event_interval_secs {
             if let Some(ref t) = tool {
                 if last_tool.as_ref() != Some(t) {
                     api.post_event(job_id, "tool", Some(t), Some(json!({"last_tool": t}))).await;
@@ -627,13 +1002,13 @@ async fn wait_until_idle_with_events(
                 api.post_event(job_id, "text", Some(&tail_chars(&text_tail, 1500)), None).await;
                 last_tail = text_tail;
             }
-            api.post_event(job_id, "status", Some(&format!("state={}", state.unwrap_or(""))), Some(json!({"state": state, "settled_count": settled}))).await;
+            api.post_event(job_id, "status", Some(&format!("state={}", last.state)), Some(json!({"state": last.state, "settled_count": last.settled_count}))).await;
             api.renew_lease(job_id).await;
             last_event_at = now;
         }
-        let terminal = matches!(state, Some("error" | "dead" | "stopped"));
-        let bumped = matches!((settled, settled_before), (Some(s), Some(b)) if s > b);
-        let idle_done = state == Some("idle") && (bumped || saw_running);
+        let terminal = matches!(last.state.as_str(), "error" | "dead" | "stopped");
+        let bumped = matches!(settled_before, Some(b) if last.settled_count > b);
+        let idle_done = last.state == "idle" && (bumped || saw_running);
         let end = decide_wait(
             terminal,
             idle_done,
@@ -650,80 +1025,83 @@ async fn wait_until_idle_with_events(
     }
 }
 
-async fn run_via_pi(api: &ApiClient, rt: &DirRuntime, job: &Job, stop: &AtomicBool) -> (bool, Option<Value>, Option<String>) {
-    if rt.pi_svc.is_none() {
-        return (false, None, Some("PI_SVC not configured; this directory can only run shell jobs until pi_svc is set in WebUI settings".into()));
-    }
-    if let Err(e) = ensure_session(rt).await {
-        return (false, None, Some(e.to_string()));
-    }
-    let before = get_status(rt).await.unwrap_or_else(|| json!({}));
-    let settled_before = status_inner(&before).get("settled_count").and_then(|v| v.as_i64());
+async fn run_via_pi(
+    api: &ApiClient,
+    sessions: &PiSessions,
+    rt: &DirRuntime,
+    job: &Job,
+    stop: &AtomicBool,
+) -> (bool, Option<Value>, Option<String>) {
+    // Spawn (or reuse) the owned `pi --mode rpc` child. A dead child is
+    // respawned here; liveness is never faked from stale state.
+    let sess = match sessions.ensure(rt).await {
+        Ok(s) => s,
+        Err(e) => return (false, None, Some(format!("pi spawn failed: {e:#}"))),
+    };
+    let settled_before = Some(sess.snapshot().await.settled_count);
     let prompt = build_pi_prompt(job);
     // Absolute wait cap: explicit job timeout wins, else the 1h default.
     // The inactivity budget (no observable progress) applies on top.
     let abs_timeout_secs = job.timeout_secs.filter(|&t| t > 0).map(|t| t as f64).unwrap_or(DEFAULT_PI_ABS_TIMEOUT as f64);
     let inactivity_secs = DEFAULT_PI_INACTIVITY_SECS;
-    // Prompt file lives in the OS temp dir — never litter the project tree.
-    let prompt_path = std::env::temp_dir().join(format!("host-ops-{}-prompt.txt", job.id));
-    if let Err(e) = tokio::fs::write(&prompt_path, prompt.as_bytes()).await {
-        return (false, None, Some(format!("write prompt: {e}")));
-    }
 
     let delivery = job.delivery_mode.as_deref().unwrap_or("steer").trim().to_lowercase();
     let job_id = job.id.to_string();
-    let st_now = get_status(rt).await.unwrap_or_else(|| json!({}));
-    let state = status_inner(&st_now).get("state").and_then(|v| v.as_str()).unwrap_or("");
-    let prompt_path_s = prompt_path.display().to_string();
-    let session = rt.pi_session.as_str();
-    let (label, send_args): (&str, Vec<&str>) = if delivery == "steer" {
-        ("steer", vec!["send", session, "--steer", "--file", &prompt_path_s])
-    } else if state == "running" {
-        ("queue+busy", vec!["send", session, "--follow-up", "--file", &prompt_path_s])
+    let busy = sess.snapshot().await.state == "running";
+    let (label, behavior): (&str, Option<&str>) = if delivery == "steer" {
+        ("steer", Some("steer"))
+    } else if busy {
+        ("queue+busy", Some("followUp"))
     } else {
-        ("queue+idle", vec!["send", session, "--file", &prompt_path_s])
+        ("queue+idle", None)
     };
-    info!(delivery = %delivery, label, "pi_svc send");
-    api.post_event(&job_id, "status", Some(&format!("pi_svc send ({delivery})")), Some(json!({"delivery_mode": delivery}))).await;
-    let out = pi_svc(rt, &send_args, (abs_timeout_secs + 30.0).min(120.0)).await;
-    if out.code != 0 {
-        let _ = tokio::fs::remove_file(&prompt_path).await;
-        let err = if out.stderr.is_empty() { out.stdout } else { out.stderr };
-        return (false, None, Some(format!("pi_svc send failed ({}): {err}", out.code)));
+    info!(delivery = %delivery, label, session = %rt.pi_session, "pi rpc send");
+    api.post_event(&job_id, "status", Some(&format!("pi rpc send ({delivery})")), Some(json!({"delivery_mode": delivery}))).await;
+    // The prompt rides inline in the RPC record — no temp prompt file.
+    let req_id = format!("p{}", Uuid::new_v4());
+    let accept = match sess.send_prompt(&req_id, &prompt, behavior).await {
+        Ok(a) => a,
+        Err(e) => return (false, None, Some(format!("pi rpc send failed: {e:#}"))),
+    };
+    if !accept.success {
+        return (false, None, Some(format!("pi rejected prompt: {}", accept.error.unwrap_or_else(|| "unknown".into()))));
     }
-    let outcome = wait_until_idle_with_events(api, rt, &job_id, abs_timeout_secs, inactivity_secs, settled_before, stop).await;
-    let final_st = outcome.status;
-    let inner_f = status_inner(&final_st);
-    let text_tail = inner_f.get("text_tail").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let tout = pi_svc(rt, &["tail", session, "--text", "-n", "40"], 30.0).await;
-    let text_log = if tout.code == 0 { tout.stdout } else { String::new() };
+    info!(session = %rt.pi_session, disposition = ?accept.disposition, "pi rpc prompt accepted");
+    let outcome = wait_until_idle_with_events(api, &sess, &job_id, abs_timeout_secs, inactivity_secs, rt.event_interval_secs, settled_before, stop).await;
+    let st = outcome.status;
+    let text_tail = st.text_tail();
     let wait_timeout = matches!(outcome.end, WaitEnd::TimeoutAbs | WaitEnd::TimeoutInactivity);
     let timeout_kind = match outcome.end {
         WaitEnd::TimeoutAbs => Some("absolute"),
         WaitEnd::TimeoutInactivity => Some("inactivity"),
         _ => None,
     };
-    let state_f = inner_f.get("state").and_then(|v| v.as_str());
     let result = truncate_result(json!({
-        "via": "pi_svc",
+        "via": "pi_rpc",
         "session": rt.pi_session,
         "provider": rt.provider,
         "model": rt.model,
         "delivery_mode": delivery,
-        "state": state_f,
-        "settled_count": inner_f.get("settled_count"),
-        "last_tool": inner_f.get("last_tool"),
+        "state": st.state,
+        "settled_count": st.settled_count,
+        "last_tool": st.last_tool,
         "text_tail": text_tail,
-        "text_log_tail": tail_chars(&text_log, 8000),
+        "text_log_tail": tail_chars(st.text_log(), 8000),
         "wait_timeout": wait_timeout,
         "timeout_kind": timeout_kind,
-        "send_stdout": clip_chars(&out.stdout, 2000),
     }));
     let mut ok = true;
     let mut err_msg = None;
-    if matches!(state_f, Some("error" | "dead")) {
+    if st.state == "dead" {
+        // The OS process is gone — never stale status. Next act respawns.
         ok = false;
-        err_msg = Some(inner_f.get("error").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| format!("session state={state_f:?}")));
+        err_msg = Some(format!(
+            "pi child process exited{}; session restarts on next job",
+            st.error.as_deref().map(|e| format!(" ({e})")).unwrap_or_default(),
+        ));
+    } else if matches!(st.state.as_str(), "error" | "stopped") {
+        ok = false;
+        err_msg = Some(st.error.clone().unwrap_or_else(|| format!("session state={}", st.state)));
     } else if outcome.end == WaitEnd::TimeoutAbs {
         // Never claim success on timeout — but say plainly the agent was
         // still working, so this reads as "needs longer", not "task failed".
@@ -731,26 +1109,25 @@ async fn run_via_pi(api: &ApiClient, rt: &DirRuntime, job: &Job, stop: &AtomicBo
         err_msg = Some(format!(
             "absolute Pi wait timeout after {}s: agent still {}",
             abs_timeout_secs as u64,
-            state_f.unwrap_or("unknown"),
+            st.state,
         ));
     } else if outcome.end == WaitEnd::TimeoutInactivity {
         ok = false;
-        err_msg = Some(if !outcome.saw_running && state_f != Some("idle") {
+        err_msg = Some(if !outcome.saw_running && st.state != "idle" {
             format!(
                 "Pi inactivity timeout after {}s: send accepted but agent never started (state={})",
                 inactivity_secs as u64,
-                state_f.unwrap_or("unknown"),
+                st.state,
             )
         } else {
             format!(
                 "Pi inactivity timeout after {}s with no progress (state={}; absolute cap {}s)",
                 inactivity_secs as u64,
-                state_f.unwrap_or("unknown"),
+                st.state,
                 abs_timeout_secs as u64,
             )
         });
     }
-    let _ = tokio::fs::remove_file(&prompt_path).await;
     (ok, Some(result), err_msg)
 }
 
@@ -794,17 +1171,17 @@ async fn run_shell_local(rt: &DirRuntime, job: &Job) -> (bool, Option<Value>, Op
     }
 }
 
-pub async fn execute_job(api: &ApiClient, rt: &DirRuntime, job: &Job, stop: &AtomicBool) -> (bool, Option<Value>, Option<String>) {
+pub async fn execute_job(api: &ApiClient, sessions: &PiSessions, rt: &DirRuntime, job: &Job, stop: &AtomicBool) -> (bool, Option<Value>, Option<String>) {
     info!(id = %job.id, job_type = %job.job_type, agent = %rt.agent_id, "execute job");
     if job.job_type == "shell" {
         let has_cmd = job.payload.get("command").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
         if has_cmd {
             return run_shell_local(rt, job).await;
         }
-        return run_via_pi(api, rt, job, stop).await;
+        return run_via_pi(api, sessions, rt, job, stop).await;
     }
     if PI_JOB_TYPES.contains(&job.job_type.as_str()) {
-        return run_via_pi(api, rt, job, stop).await;
+        return run_via_pi(api, sessions, rt, job, stop).await;
     }
     (false, None, Some(format!("unknown job type: {}", job.job_type)))
 }
@@ -841,38 +1218,28 @@ mod tests {
         assert!(reject_fast("x", "foo-fast").is_err());
     }
 
-    fn progress(state: &str, tail: &str, tool: Option<&str>, settled: Option<i64>) -> PiProgress {
-        let mut inner = serde_json::Map::new();
-        inner.insert("state".into(), Value::String(state.into()));
-        inner.insert("text_tail".into(), Value::String(tail.into()));
-        if let Some(t) = tool {
-            inner.insert("last_tool".into(), Value::String(t.into()));
-        }
-        if let Some(s) = settled {
-            inner.insert("settled_count".into(), Value::Number(s.into()));
-        }
-        PiProgress::from_status(&Value::Object({
-            let mut o = serde_json::Map::new();
-            o.insert("status".into(), Value::Object(inner));
-            o
-        }))
+    fn progress(state: &str, tail: &str, tool: Option<&str>, settled: i64) -> PiProgress {
+        let mut st = PiState::default();
+        st.state = state.into();
+        st.push_text(tail);
+        st.last_tool = tool.map(|s| s.to_string());
+        st.settled_count = settled;
+        PiProgress::from_state(&st)
     }
 
     #[test]
     fn progress_advances_on_running_or_changed_output() {
-        let empty = PiProgress::default();
         // Idle with no output change is not progress.
-        let idle = progress("idle", "", None, None);
-        assert!(!idle.advanced_since(&empty));
-        assert!(!idle.advanced_since(&idle));
+        let base = progress("idle", "", None, 0);
+        assert!(!base.advanced_since(&progress("idle", "", None, 0)));
         // Running alone counts — a thinking agent emitting nothing is working.
-        assert!(progress("running", "", None, None).advanced_since(&idle));
+        assert!(progress("running", "", None, 0).advanced_since(&base));
         // New text / tool / settled count counts even when not running.
-        assert!(progress("idle", "ab", None, None).advanced_since(&idle));
-        assert!(progress("idle", "", Some("wiki_observe"), None).advanced_since(&idle));
-        assert!(progress("idle", "", None, Some(1)).advanced_since(&progress("idle", "", None, Some(0))));
+        assert!(progress("idle", "ab", None, 0).advanced_since(&base));
+        assert!(progress("idle", "", Some("wiki_observe"), 0).advanced_since(&base));
+        assert!(progress("idle", "", None, 1).advanced_since(&base));
         // Identical snapshot twice is not progress.
-        let same = progress("idle", "ab", Some("wiki_observe"), Some(1));
+        let same = progress("idle", "ab", Some("wiki_observe"), 1);
         assert!(!same.advanced_since(&same));
     }
 
@@ -916,14 +1283,14 @@ mod tests {
         let abs = 3600.0;
         let inact = 600.0;
         // (state, tail, tool, settled, dt_secs)
-        let timeline: Vec<(&str, &str, Option<&str>, Option<i64>, f64)> = vec![
-            ("idle", "", None, None, 2.0), // send just dispatched
-            ("running", "step 1", None, None, 120.0),
-            ("running", "step 1", Some("wiki_observe"), None, 300.0),
-            ("running", "step 2: editing", Some("wiki_observe"), None, 590.0),
+        let timeline: Vec<(&str, &str, Option<&str>, i64, f64)> = vec![
+            ("idle", "", None, 0, 2.0), // send just dispatched
+            ("running", "step 1", None, 0, 120.0),
+            ("running", "step 1", Some("wiki_observe"), 0, 300.0),
+            ("running", "step 2: editing", Some("wiki_observe"), 0, 590.0),
             // Long quiet stretch, still running → progress, timer refreshes.
-            ("running", "step 2: editing", Some("wiki_observe"), None, 590.0),
-            ("idle", "done", Some("wiki_observe"), Some(1), 5.0),
+            ("running", "step 2: editing", Some("wiki_observe"), 0, 590.0),
+            ("idle", "done", Some("wiki_observe"), 1, 5.0),
         ];
         let mut prev = PiProgress::default();
         let mut saw_running = false;
@@ -960,7 +1327,7 @@ mod tests {
         let mut idle_e = 0.0;
         let mut end = WaitEnd::Continue;
         for _ in 0..7 {
-            let cur = progress("idle", "", None, None);
+            let cur = progress("idle", "", None, 0);
             if cur.advanced_since(&prev) {
                 idle_e = 0.0;
             } else {
@@ -974,5 +1341,98 @@ mod tests {
             }
         }
         assert_eq!(end, WaitEnd::TimeoutInactivity);
+    }
+
+    fn record(t: &str) -> Value {
+        json!({"type": t})
+    }
+
+    /// RPC stdout → session state mapping (mirrors pi_svcd.py semantics).
+    #[test]
+    fn rpc_record_mapping() {
+        let mut st = PiState::default();
+        let mut outbox = Vec::new();
+        // Prompt accepted + started → running.
+        apply_record(&mut st, &json!({"id":"p1","type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}), &mut outbox);
+        assert_eq!(st.state, "running");
+        assert!(outbox.is_empty());
+        // Agent lifecycle with text + tool output.
+        apply_record(&mut st, &record("agent_start"), &mut outbox);
+        assert_eq!(st.agent_starts, 1);
+        apply_record(&mut st, &json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hello "}}), &mut outbox);
+        apply_record(&mut st, &json!({"type":"tool_execution_start","toolName":"bash"}), &mut outbox);
+        assert_eq!(st.last_tool.as_deref(), Some("bash"));
+        assert_eq!(st.tool_count, 1);
+        apply_record(&mut st, &record("agent_settled"), &mut outbox);
+        assert_eq!(st.state, "idle");
+        assert_eq!(st.settled_count, 1);
+        assert_eq!(st.text_tail(), "hello ");
+        // Non-text deltas don't extend the tail.
+        apply_record(&mut st, &json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"hmm"}}), &mut outbox);
+        assert_eq!(st.text_tail(), "hello ");
+        // Synchronously-handled prompt settles immediately.
+        apply_record(&mut st, &json!({"id":"p2","type":"response","command":"prompt","success":true,"data":{"disposition":"handled"}}), &mut outbox);
+        assert_eq!(st.settled_count, 2);
+        assert_eq!(st.state, "idle");
+        // Rejected prompt records the error, settles nothing.
+        apply_record(&mut st, &json!({"id":"p3","type":"response","command":"prompt","success":false,"error":"nope"}), &mut outbox);
+        assert_eq!(st.settled_count, 2);
+        assert_eq!(st.error.as_deref(), Some("nope"));
+        // Dialogs get unattended replies; fire-and-forget gets none.
+        outbox.clear();
+        apply_record(&mut st, &json!({"id":"d1","type":"extension_ui_request","method":"confirm"}), &mut outbox);
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0]["confirmed"], json!(true));
+        outbox.clear();
+        apply_record(&mut st, &json!({"id":"d2","type":"extension_ui_request","method":"select","options":["a","b"]}), &mut outbox);
+        assert_eq!(outbox[0]["value"], json!("a"));
+        outbox.clear();
+        apply_record(&mut st, &json!({"id":"d3","type":"extension_ui_request","method":"input"}), &mut outbox);
+        assert_eq!(outbox[0]["value"], json!(""));
+        outbox.clear();
+        apply_record(&mut st, &json!({"id":"d4","type":"extension_ui_request","method":"editor"}), &mut outbox);
+        assert_eq!(outbox[0]["cancelled"], json!(true));
+        outbox.clear();
+        apply_record(&mut st, &json!({"id":"d5","type":"extension_ui_request","method":"setStatus"}), &mut outbox);
+        apply_record(&mut st, &json!({"id":"d6","type":"extension_ui_request","method":"notify"}), &mut outbox);
+        assert!(outbox.is_empty());
+        assert_eq!(st.ui_dialogs, 4);
+        // Error record marks the session.
+        apply_record(&mut st, &json!({"type":"error","message":"boom"}), &mut outbox);
+        assert_eq!(st.state, "error");
+        assert!(st.error.is_some());
+        // Prompt-accept parsing for the send path.
+        let a = PromptAccept::from_response(&json!({"id":"p1","type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}));
+        assert!(a.success);
+        assert_eq!(a.disposition.as_deref(), Some("started"));
+        let a = PromptAccept::from_response(&json!({"type":"response","success":false,"error":"pi child exited"}));
+        assert!(!a.success);
+        assert_eq!(a.error.as_deref(), Some("pi child exited"));
+    }
+
+    #[test]
+    fn child_wait_classification() {
+        // Still running → alive.
+        assert_eq!(classify_wait(Ok(None)), ChildAlive::Running);
+        // Lookup errors are treated as dead, never as alive.
+        assert_eq!(
+            classify_wait(Err(std::io::Error::new(std::io::ErrorKind::Other, "x"))),
+            ChildAlive::Exited(None)
+        );
+    }
+
+    /// A real exited OS process classifies as not-alive (no pi binary needed).
+    #[cfg(unix)]
+    #[test]
+    fn exited_process_is_not_alive() {
+        let status = std::process::Command::new("true").status().unwrap();
+        assert_eq!(classify_wait(Ok(Some(status))), ChildAlive::Exited(Some(0)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exited_process_is_not_alive() {
+        let status = std::process::Command::new("cmd").args(["/C", "exit 3"]).status().unwrap();
+        assert_eq!(classify_wait(Ok(Some(status))), ChildAlive::Exited(Some(3)));
     }
 }

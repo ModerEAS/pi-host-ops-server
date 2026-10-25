@@ -9,7 +9,7 @@ Dispatcher  --Bearer DISPATCHER-->  Server (Rust)
                                       |  jobs + agents + job_events (SQLite)
 Pi workers  --Bearer per-agent---->  claim / heartbeat / events / result
                                       |
-                                   pi_svc (box) or host ops
+                                   pi --mode rpc (box) or host ops
 ```
 
 ## Auth
@@ -43,7 +43,7 @@ cargo run --release
 
 Only the **server** (dispatcher HTTP + SQLite) is containerized — image
 `ghcr.io/moderras/pi-host-ops-server` (`:latest` + `:sha-<commit>` on master).
-The worker stays host-installed (needs host `pi_svc` / project dirs).
+The worker stays host-installed (needs host `pi` binary / project dirs).
 
 ```bash
 docker compose up --build   # local: server on :8787, SQLite in a volume
@@ -93,15 +93,15 @@ curl -sS http://127.0.0.1:8787/v1/agents \
 
 ### `delivery_mode`
 
-| Value | Worker behavior (`pi_svc`) |
-|-------|----------------------------|
-| **`steer`** (default) | `pi_svc send --steer` — interrupt/redirect current turn |
-| **`queue`** | idle → normal `send`; busy → `send --follow-up` |
+| Value | Worker behavior (`pi --mode rpc`) |
+|-------|--------------------------------------|
+| **`steer`** (default) | prompt with `streamingBehavior: steer` — interrupt/redirect current turn |
+| **`queue`** | idle → plain prompt; busy → prompt with `streamingBehavior: followUp` |
 
 ### Pi idle wait (activity-based)
 
-After `send`, the worker waits for the Pi session to go idle with **two
-budgets** (see `src/bin/worker/runtime.rs`):
+After the RPC prompt is accepted, the worker waits for the Pi session to go
+idle with **two budgets** (see `src/bin/worker/runtime.rs`):
 
 - **Absolute cap** — the job's `timeout_secs` if set, else **3600s (1h)**.
   A long coding/`act` run never fails just for being slow.
@@ -115,6 +115,16 @@ result keeps `wait_timeout`, `timeout_kind` (`absolute`/`inactivity`), and
 tails. A send that never starts the agent fails as an inactivity timeout
 with a distinct message. Pass `--timeout` (`host-ops job create` / `steer`)
 only when a job needs more than the 1h default.
+
+### Pi child liveness (no pi_svc)
+
+The worker owns one long-lived `pi --mode rpc` child per enabled directory
+(no `pi_svc` / control socket anywhere). Liveness is the OS process itself:
+if the child is gone, the directory shows an error in the WebUI ("pi process
+exited — restarts on next job"), the wait ends as a failure (never as fake
+idle success), and the next `act` job spawns a fresh child. Server-side
+agent online/offline still follows the worker heartbeat (see § Worker
+multiplexing), so dispatch routing keeps working.
 
 ## Feedback events
 
@@ -210,7 +220,7 @@ host-ops agents create --id duolinzao-scale --label duolinzao --project duolinza
 host-ops job create --type observe --payload '{"focus":"cwd"}' --agent duolinzao-scale --thread feature-x
 host-ops job watch <job-id>
 
-# 纠正 / 打断进行中的 Pi 会话：payload.prompt 几乎原样进 pi_svc send --steer
+# 纠正 / 打断进行中的 Pi 会话：payload.prompt 几乎原样进 pi --mode rpc prompt（streamingBehavior: steer）
 host-ops steer --agent duolinzao-scale --thread feature-x --prompt '纠正：不要改 README，只修编译错误'
 # 或从已有 job 推断 agent/thread：
 host-ops job steer <job-uuid> --prompt-file ./correction.txt
@@ -218,14 +228,14 @@ host-ops job steer <job-uuid> --prompt-file ./correction.txt
 host-ops job create --type act --prompt '继续完成剩余测试' --agent duolinzao-scale --delivery steer
 ```
 
-Worker 侧：若 payload 含字符串字段 **`prompt`**（或 `message` / `text`），则发给 `pi_svc` 的正文就是该字符串（仅加一行 `[host-ops job <id>]` 前缀），不再包一整段 JSON boilerplate。
+Worker 侧：若 payload 含字符串字段 **`prompt`**（或 `message` / `text`），则发给 Pi 的正文就是该字符串（仅加一行 `[host-ops job <id>]` 前缀），不再包一整段 JSON boilerplate。
 
 ## Worker (embedded WebUI)
 
 One local **worker** process manages many project directories via a small WebUI.
 
 - Open **http://127.0.0.1:8788/** after starting the worker
-- Add directories (each = one agent / pi_svc session) and set **provider/model** per dir
+- Add directories (each = one agent / pi rpc session) and set **provider/model** per dir
 - Config: `~/.config/pi-host-ops/config.json` or `%APPDATA%\pi-host-ops\config.json` — **never** project litter
 - Default model: `muse-spark-1.3-contributor` / `opencode-go` — **Fast is blocked** (UI + API)
 - Change model: edit the directory row in the WebUI (or `provider`/`model` on `POST /v1/agents` / `PATCH /v1/agent/me`)
@@ -325,4 +335,4 @@ cargo test
 ## Notes
 
 - Do **not** use Cursor CloudAgent / Fast models from the worker.
-- Box is shared: unique `pi_svc` session names; never `stop` others' sessions.
+- Box is shared: unique `pi` session names; never `stop` others' sessions.

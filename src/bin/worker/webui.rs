@@ -74,7 +74,7 @@ struct SettingsBody {
     dispatcher_token: Option<String>,
     worker_token: Option<String>,
     worker_id: Option<Option<String>>,
-    pi_svc: Option<Option<String>>,
+    pi_bin: Option<Option<String>>,
 }
 
 async fn put_settings(State(st): State<Arc<AppState>>, Json(body): Json<SettingsBody>) -> Response {
@@ -97,8 +97,8 @@ async fn put_settings(State(st): State<Arc<AppState>>, Json(body): Json<Settings
     if let Some(w) = body.worker_id {
         cfg.worker_id = w.filter(|s| !s.trim().is_empty());
     }
-    if let Some(p) = body.pi_svc {
-        cfg.pi_svc = p.and_then(|s| {
+    if let Some(p) = body.pi_bin {
+        cfg.pi_bin = p.and_then(|s| {
             let s = s.trim().to_string();
             if s.is_empty() {
                 None
