@@ -16,6 +16,11 @@ on:
         required: false
         type: string
         default: ""
+      phase:
+        description: "build: compile + upload artifacts only; publish: create tag + release from artifacts only; all: both (default, for tag push / workflow_dispatch)."
+        required: false
+        type: string
+        default: "all"
 
 permissions:
   contents: write
@@ -26,6 +31,9 @@ env:
 jobs:
   build:
     name: build-${{ matrix.target }}
+    # publish-only calls skip this (binaries come from the earlier build call
+    # in the same caller run); tag push / dispatch / all run it.
+    if: ${{ !inputs.phase || inputs.phase == 'all' || inputs.phase == 'build' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -166,6 +174,9 @@ jobs:
   publish:
     name: publish-release
     needs: build
+    # build may be skipped (phase=publish reuses artifacts from the earlier
+    # build call), so keep this alive with always() and check the result.
+    if: ${{ always() && (needs.build.result == 'success' || needs.build.result == 'skipped') && (!inputs.phase || inputs.phase == 'all' || inputs.phase == 'publish') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -251,9 +262,10 @@ jobs:
             host-ops config set --url 'https://your-server:8787' --token '<DISPATCHER_TOKEN>'
             ```
 
-            Releases are auto-published after each successful production deploy
-            (`v<next-patch>` at the deployed commit, marked latest); manual
-            `workflow_dispatch` with a `tag` input still works.
+            Releases are built before deploy and auto-published after each
+            successful production deploy (`v<next-patch>` at the deployed
+            commit, marked latest); manual `workflow_dispatch` with a `tag`
+            input still works.
           files: |
             release-assets/worker-*
             release-assets/host-ops-*

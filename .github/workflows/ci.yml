@@ -148,7 +148,7 @@ jobs:
   deploy:
     name: deploy to Swarm (production)
     runs-on: ubuntu-latest
-    needs: image
+    needs: [image, binaries]
     # Main repo master push only; forks and PRs never deploy. Server is never
     # built on the manager — pull GHCR + `docker stack deploy` only.
     if: github.repository == 'ModerRAS/pi-host-ops-server' && github.ref == 'refs/heads/master' && github.event_name == 'push'
@@ -269,12 +269,27 @@ jobs:
           ssh -i ~/.ssh/id_deploy -p "${DEPLOY_PORT:-22}" -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts -o BatchMode=yes \
             "${DEPLOY_USER}@${DEPLOY_HOST}" "docker image prune -f"
 
+  binaries:
+    name: build release binaries (before deploy approval)
+    needs: [version, test]
+    # Same gate as deploy: main repo master push only; PRs skip (binaries are
+    # built in parallel with the image, before production approval blocks deploy).
+    if: github.repository == 'ModerRAS/pi-host-ops-server' && github.ref == 'refs/heads/master' && github.event_name == 'push'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    secrets: inherit
+    with:
+      tag: ${{ needs.version.outputs.tag }}
+      phase: build
+
   release:
-    name: tag + release binaries (after production deploy)
+    name: publish GitHub release (tag + upload, no rebuild)
     needs: [version, deploy]
     # Same gate as deploy: main repo master push only. The tag is created here
     # (after deploy success) at the deployed commit — a GITHUB_TOKEN tag push
     # would NOT retrigger workflows, hence the reusable-workflow call.
+    # Artifacts come from the binaries job's phase=build call in this same run.
     if: github.repository == 'ModerRAS/pi-host-ops-server' && github.ref == 'refs/heads/master' && github.event_name == 'push'
     concurrency:
       group: deploy-production
@@ -285,3 +300,4 @@ jobs:
     secrets: inherit
     with:
       tag: ${{ needs.version.outputs.tag }}
+      phase: publish

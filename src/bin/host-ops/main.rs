@@ -114,6 +114,7 @@ enum JobCmd {
         thread: Option<String>,
         #[arg(long, value_enum, default_value_t = Delivery::Steer)]
         delivery: Delivery,
+        /// Absolute Pi wait cap in seconds (default 3600; idle wait is activity-based)
         #[arg(long)]
         timeout: Option<u64>,
     },
@@ -156,6 +157,7 @@ struct SteerArgs {
     prompt: Option<String>,
     #[arg(long, conflicts_with = "prompt")]
     prompt_file: Option<PathBuf>,
+    /// Absolute Pi wait cap in seconds (default 3600; idle wait is activity-based)
     #[arg(long)]
     timeout: Option<u64>,
     #[arg(long = "type", default_value = "act")]
@@ -174,6 +176,7 @@ struct JobSteerArgs {
     prompt: Option<String>,
     #[arg(long, conflicts_with = "prompt")]
     prompt_file: Option<PathBuf>,
+    /// Absolute Pi wait cap in seconds (default 3600; idle wait is activity-based)
     #[arg(long)]
     timeout: Option<u64>,
     #[arg(long = "type", default_value = "act")]

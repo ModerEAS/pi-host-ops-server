@@ -126,8 +126,10 @@ Deploy condition: main repo (`ModerRAS/pi-host-ops-server`) + `refs/heads/master
 
 1. `test` green → `image` builds and pushes
    `ghcr.io/moderras/pi-host-ops-server:sha-<commit>` (+ `latest` +
-   the upcoming release tag `v<next>`).
-2. `deploy`: scp `stack.yml` to `DEPLOY_PATH`; inject
+   the upcoming release tag `v<next>`), **in parallel with** `binaries`
+   (all release binaries compiled + uploaded as workflow artifacts).
+2. `deploy` (needs both, so production approval only blocks here; a failed
+   build never reaches deploy): scp `stack.yml` to `DEPLOY_PATH`; inject
    `IMAGE_TAG`/`HOST_OPS_DOMAIN`/Traefik vars; then
    `docker stack deploy -c stack.yml --with-registry-auth host-ops`.
 3. Poll `host-ops_server`: spec or running tasks carry the new tag prefix
@@ -136,9 +138,9 @@ Deploy condition: main repo (`ModerRAS/pi-host-ops-server`) + `refs/heads/master
    `failure_action: rollback` already auto-rolled-back by Swarm).
 4. Runner `curl https://domain/health` with retries (5 min).
 5. `docker image prune -f` cleans old images.
-6. `release` (after deploy success): creates tag `v<next>` at the deployed
-   commit and publishes the GitHub Release (marked latest) with all
-   binaries — no manual tag pushing.
+6. `release` (publish phase, after deploy success): creates tag `v<next>`
+   at the deployed commit and publishes the GitHub Release (marked latest)
+   from the already-built artifacts — **no rebuild**, no manual tag pushing.
 
 ### Tag scheme (`v<next>`)
 

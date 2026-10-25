@@ -33,7 +33,33 @@ cargo run --release --bin worker
 
 1. WebUI edits save to user config dir
 2. For each enabled directory: register agent (dispatcher token) once, store token in config, heartbeat + poll
-3. Jobs run with that directory as cwd; `pi_svc start --provider --model` uses the directory’s model
+3. Jobs run with that directory as cwd; `pi_svc start --provider --model` uses the directory's model
 4. Without `pi_svc`, only `shell` jobs succeed (typical early Windows setup)
+
+## Multiplexed mode (many directories, one worker)
+
+Per-directory heartbeat + long-poll serially (`8s × N`) exceeds the server
+`HEARTBEAT_TTL` (~45s) once you have more than a few dirs, so agents falsely
+flap offline. Set a **worker token** (WebUI Settings → Worker token) to
+switch this worker to multiplexed mode:
+
+1. On the server (dispatcher): `POST /v1/workers` → save the token once.
+2. Bind each directory agent: `POST /v1/workers/{id}/agents`
+   `{"agent_id":"..."}` (see server README § Worker multiplexing).
+3. Paste the token into WebUI Settings (saved to the user config dir only).
+
+Then the worker sends **one batch heartbeat every ~15s** (background task, so
+it keeps flowing while a job runs) plus **one long-poll** for all bound
+agents, and still executes only **one job at a time**. Empty worker token =
+legacy per-directory mode (unchanged).
+
+## Pi idle wait
+
+After `pi_svc send`, the worker waits for the session to go idle with two
+budgets: an **absolute cap** (the job's `timeout_secs`, else **1h**) and an
+**inactivity budget** (**10 min** with no `running` state / output change).
+Long coding runs keep their lease renewed and stay alive while they work;
+a timeout while still `running` is reported as a wait timeout, not a task
+failure. Needs more than 1h? Pass `--timeout` on `host-ops job create` / `steer`.
 
 Never uses Cursor CloudAgent / Fast.

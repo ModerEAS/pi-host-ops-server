@@ -18,7 +18,9 @@ Pi workers  --Bearer per-agent---->  claim / heartbeat / events / result
 |----------|------|
 | `GET /health` | **public** |
 | `POST/GET /v1/jobs*`, `GET /v1/agents*`, `DELETE /v1/agents/:id` | **Dispatcher** `Authorization: Bearer $DISPATCHER_TOKEN` |
+| `POST/GET/DELETE /v1/workers*` (create/list/revoke workers, bind/unbind agents) | **Dispatcher** |
 | `POST /v1/agent/*` | **Agent** Bearer = that agent's token (sha256 stored; plaintext shown once at create) |
+| `POST /v1/worker/heartbeat`, `POST /v1/worker/poll` | **Worker** Bearer = worker token (one batch heartbeat + one multiplexed poll for all bound agents) |
 
 Wrong role → **403**. Missing/invalid → **401**.
 
@@ -96,6 +98,24 @@ curl -sS http://127.0.0.1:8787/v1/agents \
 | **`steer`** (default) | `pi_svc send --steer` — interrupt/redirect current turn |
 | **`queue`** | idle → normal `send`; busy → `send --follow-up` |
 
+### Pi idle wait (activity-based)
+
+After `send`, the worker waits for the Pi session to go idle with **two
+budgets** (see `src/bin/worker/runtime.rs`):
+
+- **Absolute cap** — the job's `timeout_secs` if set, else **3600s (1h)**.
+  A long coding/`act` run never fails just for being slow.
+- **Inactivity budget** — **600s (10 min)** with no observable progress
+  (`running` state, or `text_tail` / `last_tool` / `settled_count` changing).
+  While the agent works, the deadline keeps refreshing.
+
+A timeout while the agent is still `running` fails the job but says so
+plainly (`absolute Pi wait timeout after …: agent still running`), and the
+result keeps `wait_timeout`, `timeout_kind` (`absolute`/`inactivity`), and
+tails. A send that never starts the agent fails as an inactivity timeout
+with a distinct message. Pass `--timeout` (`host-ops job create` / `steer`)
+only when a job needs more than the 1h default.
+
 ## Feedback events
 
 While a job is `running`, the claiming agent may POST incremental events:
@@ -164,6 +184,7 @@ Statuses: `queued` | `running` | `succeeded` | `failed` | `timed_out` | `no_agen
 - `002_agents_routing` — `agents` + job target / `delivery_mode` (default **steer**) / lease / timeout
 - `003_job_events` — incremental feedback
 - `004_agent_model` — per-agent `pi_provider` / `pi_model`
+- `005_workers` — `workers` + `worker_agents` bindings (one agent belongs to at most one worker)
 
 
 ## Dispatcher CLI (`host-ops`)
@@ -238,6 +259,61 @@ cargo run --release --bin worker      # terminal B — WebUI + pollers
 
 - `GET /v1/agent/me` — agent reads its registration (cwd/project/provider/model)
 - `PATCH /v1/agent/me` — agent updates cwd / provider / model (Fast rejected)
+
+## Worker multiplexing (batch heartbeat + single poll)
+
+With ~18 enabled directories, per-directory heartbeat + long-poll (`8s × N`)
+exceeds `HEARTBEAT_TTL` (~45s) and agents falsely flap offline. A **worker**
+credential fixes this: one batch heartbeat every ~15s + one multiplexed poll
+covering all agents bound to that worker. Execution stays **serial** (one job
+at a time); results/events/leases still use each agent's own token.
+
+```bash
+# 1. Dispatcher creates a worker (token shown once)
+curl -sS -X POST http://127.0.0.1:8787/v1/workers \
+  -H "Authorization: Bearer $DISPATCHER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"id":"box-main","label":"box main worker"}'
+# → {"id":"box-main","token":"<save-me>","label":"..."}
+
+# 2. Bind each directory agent to the worker (one agent ≤ one worker)
+curl -sS -X POST http://127.0.0.1:8787/v1/workers/box-main/agents \
+  -H "Authorization: Bearer $DISPATCHER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id":"myproj-a1b2c3d4"}'
+
+# 3. Paste the worker token into the worker WebUI Settings
+#    (or `worker_token` in `~/.config/pi-host-ops/config.json`).
+#    When set, the worker sends ~1 heartbeat/15s + 1 poll for all dirs.
+#    When empty, it keeps the legacy per-directory heartbeat+poll.
+```
+
+Worker API:
+
+```bash
+# Batch heartbeat — only bound agents; unbound ids → 403, nothing updated
+curl -sS -X POST http://127.0.0.1:8787/v1/worker/heartbeat \
+  -H "Authorization: Bearer $WORKER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agents":[{"agent_id":"a","status":"online"},{"agent_id":"b","status":"busy"}]}'
+
+# Multiplexed poll — claims a job for any bound *online* agent
+curl -sS -D- -X POST http://127.0.0.1:8787/v1/worker/poll \
+  -H "Authorization: Bearer $WORKER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"wait_secs":20}'
+# 200 {"job": {...}, "agent_id": "..."} or 204
+```
+
+Notes:
+
+- `POST /v1/worker/poll` only considers bound agents seen within
+  `HEARTBEAT_TTL` — a dir removed/disabled on the worker ages out instead of
+  claiming jobs it can no longer run (unbind it to remove immediately).
+- Old single-agent `POST /v1/agent/heartbeat` and `POST /v1/agent/poll` keep
+  working unchanged.
+- Revoking a worker (`DELETE /v1/workers/:id`) invalidates its token and
+  releases its bindings.
 
 ## Tests / smoke
 

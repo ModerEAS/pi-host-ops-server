@@ -72,6 +72,8 @@ struct SettingsBody {
     host_ops_url: Option<String>,
     webui_bind: Option<String>,
     dispatcher_token: Option<String>,
+    worker_token: Option<String>,
+    worker_id: Option<Option<String>>,
     pi_svc: Option<Option<String>>,
 }
 
@@ -88,6 +90,12 @@ async fn put_settings(State(st): State<Arc<AppState>>, Json(body): Json<Settings
     }
     if let Some(t) = body.dispatcher_token {
         cfg.dispatcher_token = t;
+    }
+    if let Some(t) = body.worker_token {
+        cfg.worker_token = t;
+    }
+    if let Some(w) = body.worker_id {
+        cfg.worker_id = w.filter(|s| !s.trim().is_empty());
     }
     if let Some(p) = body.pi_svc {
         cfg.pi_svc = p.and_then(|s| {

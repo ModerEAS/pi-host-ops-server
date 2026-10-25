@@ -12,12 +12,15 @@ use crate::AppState;
 pub enum Role {
     Dispatcher,
     Agent,
+    Worker,
 }
 
 pub struct AuthUser {
     pub role: Role,
     /// Set when role == Agent (looked up from token_hash).
     pub agent_id: Option<String>,
+    /// Set when role == Worker (looked up from token_hash).
+    pub worker_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -62,10 +65,37 @@ impl FromRequestParts<AppState> for AuthUser {
             return Ok(AuthUser {
                 role: Role::Dispatcher,
                 agent_id: None,
+                worker_id: None,
             });
         }
 
         let token_hash = hash_token(token);
+
+        // Worker credential (multiplexed heartbeat + poll over bound agents).
+        match state.db.find_worker_by_token_hash(&token_hash).await {
+            Ok(Some(worker)) => {
+                if worker.revoked_at.is_some() {
+                    return Err(AuthError(
+                        StatusCode::UNAUTHORIZED,
+                        "worker token revoked".into(),
+                    ));
+                }
+                return Ok(AuthUser {
+                    role: Role::Worker,
+                    agent_id: None,
+                    worker_id: Some(worker.id),
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::error!(?err, "worker token lookup failed");
+                return Err(AuthError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "auth lookup failed".into(),
+                ));
+            }
+        }
+
         match state.db.find_agent_by_token_hash(&token_hash).await {
             Ok(Some(agent)) => {
                 if agent.revoked_at.is_some() {
@@ -77,6 +107,7 @@ impl FromRequestParts<AppState> for AuthUser {
                 Ok(AuthUser {
                     role: Role::Agent,
                     agent_id: Some(agent.id),
+                    worker_id: None,
                 })
             }
             Ok(None) => Err(AuthError(StatusCode::UNAUTHORIZED, "invalid token".into())),
@@ -111,6 +142,19 @@ pub fn require_agent(user: &AuthUser) -> Result<&str, AuthError> {
         Err(AuthError(
             StatusCode::FORBIDDEN,
             "agent token required".into(),
+        ))
+    }
+}
+
+pub fn require_worker(user: &AuthUser) -> Result<&str, AuthError> {
+    if user.role == Role::Worker {
+        user.worker_id
+            .as_deref()
+            .ok_or_else(|| AuthError(StatusCode::UNAUTHORIZED, "worker id missing".into()))
+    } else {
+        Err(AuthError(
+            StatusCode::FORBIDDEN,
+            "worker token required".into(),
         ))
     }
 }

@@ -305,6 +305,71 @@ pub struct LeaseResponse {
     pub lease_expires_at: DateTime<Utc>,
 }
 
+// ── Workers (multiplexed heartbeat + poll) ────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CreateWorkerRequest {
+    pub id: Option<String>,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateWorkerResponse {
+    pub id: String,
+    /// Plaintext token — shown once. Store hash only on server.
+    pub token: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerInfo {
+    pub id: String,
+    pub label: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub agents: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BindAgentRequest {
+    pub agent_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkerHeartbeatAgent {
+    pub agent_id: String,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkerHeartbeatRequest {
+    pub agents: Vec<WorkerHeartbeatAgent>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkerHeartbeatResponse {
+    pub worker_id: String,
+    pub updated: Vec<String>,
+    pub last_seen_at: DateTime<Utc>,
+    pub server_time: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkerPollRequest {
+    /// Long-poll wait in seconds (0–25). Default 0 = return immediately.
+    pub wait_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkerPollResponse {
+    pub job: Job,
+    pub agent_id: String,
+}
+
 
 #[derive(Debug, Deserialize)]
 pub struct AppendEventRequest {

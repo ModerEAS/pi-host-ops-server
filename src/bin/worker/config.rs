@@ -22,6 +22,14 @@ pub struct WorkerConfig {
     /// Optional path to pi_svc; if missing, non-shell jobs fail clearly.
     #[serde(default)]
     pub pi_svc: Option<String>,
+    /// Worker credential for multiplexed heartbeat + poll (one batch + one
+    /// poll covering all enabled/registered dirs). When empty, the worker
+    /// falls back to legacy per-directory heartbeat + poll.
+    #[serde(default)]
+    pub worker_token: String,
+    /// Informational worker id (shown in WebUI); auth uses worker_token.
+    #[serde(default)]
+    pub worker_id: Option<String>,
     #[serde(default)]
     pub directories: Vec<DirEntry>,
 }
@@ -69,6 +77,8 @@ impl Default for WorkerConfig {
             dispatcher_token: String::new(),
             webui_bind: DEFAULT_WEBUI_BIND.into(),
             pi_svc: None,
+            worker_token: String::new(),
+            worker_id: None,
             directories: Vec::new(),
         }
     }
@@ -179,6 +189,8 @@ pub fn public_config(cfg: &WorkerConfig, path: &Path) -> serde_json::Value {
     serde_json::json!({
         "host_ops_url": cfg.host_ops_url,
         "dispatcher_token": cfg.dispatcher_token,
+        "worker_token": cfg.worker_token,
+        "worker_id": cfg.worker_id,
         "webui_bind": cfg.webui_bind,
         "pi_svc": cfg.pi_svc,
         "directories": cfg.directories,

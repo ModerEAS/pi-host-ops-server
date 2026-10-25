@@ -248,6 +248,209 @@ impl Db {
         Ok(n)
     }
 
+    // ── Workers ─────────────────────────────────────────────────────────
+    // One worker process multiplexes many agents: one batch heartbeat +
+    // one poll covering all bound agents (serial execution by default).
+
+    pub async fn create_worker(&self, id: &str, token: &str, label: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let token_hash = hash_token(token);
+        sqlx::query(
+            r#"
+            INSERT INTO workers (id, token_hash, label, created_at, revoked_at, last_seen_at)
+            VALUES (?, ?, ?, ?, NULL, NULL)
+            "#,
+        )
+        .bind(id)
+        .bind(&token_hash)
+        .bind(label)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn find_worker_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<WorkerRow>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, label, created_at, revoked_at, last_seen_at
+            FROM workers WHERE token_hash = ?
+            "#,
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_worker_row).transpose()?)
+    }
+
+    pub async fn get_worker(&self, id: &str) -> Result<Option<WorkerRow>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, label, created_at, revoked_at, last_seen_at
+            FROM workers WHERE id = ?
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_worker_row).transpose()?)
+    }
+
+    pub async fn list_workers(&self) -> Result<Vec<WorkerRow>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, label, created_at, revoked_at, last_seen_at
+            FROM workers
+            ORDER BY created_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_worker_row).collect()
+    }
+
+    pub async fn revoke_worker(&self, id: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            "UPDATE workers SET revoked_at = ?, token_hash = ? WHERE id = ? AND revoked_at IS NULL",
+        )
+        .bind(&now)
+        // Invalidate token by replacing hash with an unusable value
+        .bind(format!("revoked:{}", Uuid::new_v4()))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Ok(false);
+        }
+        // Release bindings so agents can be re-bound to another worker.
+        sqlx::query("DELETE FROM worker_agents WHERE worker_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(true)
+    }
+
+    /// Agent ids bound to this worker, sorted for deterministic claim order.
+    pub async fn worker_agents(&self, worker_id: &str) -> Result<Vec<String>> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT agent_id FROM worker_agents WHERE worker_id = ? ORDER BY agent_id ASC",
+        )
+        .bind(worker_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn worker_id_for_agent(&self, agent_id: &str) -> Result<Option<String>> {
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT worker_id FROM worker_agents WHERE agent_id = ?",
+        )
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn bind_agent_to_worker(
+        &self,
+        worker_id: &str,
+        agent_id: &str,
+    ) -> Result<BindOutcome> {
+        match self.get_worker(worker_id).await? {
+            Some(w) if w.revoked_at.is_none() => {}
+            _ => return Ok(BindOutcome::WorkerNotFound),
+        }
+        match self.get_agent(agent_id).await? {
+            Some(a) if a.revoked_at.is_none() => {}
+            _ => return Ok(BindOutcome::AgentNotFound),
+        }
+        if let Some(other) = self.worker_id_for_agent(agent_id).await? {
+            if other == worker_id {
+                return Ok(BindOutcome::Ok);
+            }
+            return Ok(BindOutcome::AlreadyBound(other));
+        }
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO worker_agents (worker_id, agent_id, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(worker_id)
+        .bind(agent_id)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(BindOutcome::Ok)
+    }
+
+    pub async fn unbind_agent_from_worker(
+        &self,
+        worker_id: &str,
+        agent_id: &str,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "DELETE FROM worker_agents WHERE worker_id = ? AND agent_id = ?",
+        )
+        .bind(worker_id)
+        .bind(agent_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Batch-refresh `last_seen_at` / `status` for this worker's bound agents
+    /// in one shot. Callers must ensure every id is bound to `worker_id`.
+    pub async fn heartbeat_many(
+        &self,
+        worker_id: &str,
+        entries: &[(String, String)],
+    ) -> Result<DateTime<Utc>> {
+        let now = Utc::now();
+        let now_s = now.to_rfc3339();
+        // Group by status so mixed online/busy batches need at most a few queries.
+        let mut by_status: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
+        for (id, status) in entries {
+            by_status.entry(status.as_str()).or_default().push(id.as_str());
+        }
+        for (status, ids) in by_status {
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "UPDATE agents SET last_seen_at = ?, status = ? \
+                 WHERE id IN ({placeholders}) AND revoked_at IS NULL"
+            );
+            let mut q = sqlx::query(&sql).bind(&now_s).bind(status);
+            for id in ids {
+                q = q.bind(id);
+            }
+            q.execute(&self.pool).await?;
+        }
+        sqlx::query("UPDATE workers SET last_seen_at = ? WHERE id = ? AND revoked_at IS NULL")
+            .bind(&now_s)
+            .bind(worker_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(now)
+    }
+
+    /// Claim the next matching job for any of these agents (in order),
+    /// reusing the single-agent claim/lease/concurrency rules.
+    pub async fn claim_next_job_for_agents(
+        &self,
+        agent_ids: &[String],
+        lease_secs: i64,
+    ) -> Result<Option<(Job, String)>> {
+        for agent_id in agent_ids {
+            if let Some(job) = self.claim_next_job_for_agent(agent_id, lease_secs).await? {
+                return Ok(Some((job, agent_id.clone())));
+            }
+        }
+        Ok(None)
+    }
+
     // ── Jobs ────────────────────────────────────────────────────────────
 
     pub async fn insert_job(
@@ -826,6 +1029,23 @@ impl Db {
 }
 
 #[derive(Debug, Clone)]
+pub struct WorkerRow {
+    pub id: String,
+    pub label: String,
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug)]
+pub enum BindOutcome {
+    Ok,
+    WorkerNotFound,
+    AgentNotFound,
+    AlreadyBound(String),
+}
+
+#[derive(Debug, Clone)]
 pub struct AgentRow {
     pub id: String,
     pub label: String,
@@ -911,6 +1131,19 @@ pub enum AppendEventOutcome {
     NotFound,
     WrongStatus(JobStatus),
     Forbidden,
+}
+
+fn row_to_worker_row(row: SqliteRow) -> Result<WorkerRow> {
+    let revoked: Option<String> = row.try_get("revoked_at")?;
+    let seen: Option<String> = row.try_get("last_seen_at")?;
+    let created: String = row.try_get("created_at")?;
+    Ok(WorkerRow {
+        id: row.try_get("id")?,
+        label: row.try_get("label")?,
+        created_at: parse_dt(&created)?,
+        revoked_at: revoked.map(|s| parse_dt(&s)).transpose()?,
+        last_seen_at: seen.map(|s| parse_dt(&s)).transpose()?,
+    })
 }
 
 fn row_to_agent_row(row: SqliteRow) -> Result<AgentRow> {
