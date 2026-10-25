@@ -16,7 +16,12 @@ use crate::config::{reject_fast, DEFAULT_MODEL, DEFAULT_PROVIDER};
 
 const MAX_RESULT_BYTES: usize = 512 * 1024;
 const DEFAULT_SHELL_TIMEOUT: u64 = 60;
-const DEFAULT_PI_TIMEOUT: u64 = 300;
+/// Absolute cap on the Pi idle wait when the job sets no `timeout_secs` (1h).
+/// A long coding/`act` run must never fail just for being slow.
+const DEFAULT_PI_ABS_TIMEOUT: u64 = 3600;
+/// Give up only after this long with no observable Pi activity (10 min).
+/// While the agent is `running` or its output keeps changing, we keep waiting.
+const DEFAULT_PI_INACTIVITY_SECS: f64 = 600.0;
 const POLL_STATUS_INTERVAL: f64 = 2.0;
 
 const PI_JOB_TYPES: &[&str] = &["observe", "act", "open", "clipboard", "notify"];
@@ -486,23 +491,115 @@ job_id: {}\ntype: {}\ntimeout_secs: {:?}\npayload:\n{}\n",
     )
 }
 
+/// Observable Pi progress snapshot driving the idle-wait policy.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct PiProgress {
+    running: bool,
+    settled_count: Option<i64>,
+    last_tool: Option<String>,
+    text_tail: String,
+}
+
+impl PiProgress {
+    fn from_status(st: &Value) -> Self {
+        let inner = status_inner(st);
+        Self {
+            running: inner.get("state").and_then(|v| v.as_str()) == Some("running"),
+            settled_count: inner.get("settled_count").and_then(|v| v.as_i64()),
+            last_tool: inner
+                .get("last_tool")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            text_tail: inner
+                .get("text_tail")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        }
+    }
+
+    /// The agent is observably doing work (or produced new output) since prev.
+    /// `running` alone counts — a coding agent thinking without emitting
+    /// tools/text for a while is still working, not stuck.
+    fn advanced_since(&self, prev: &Self) -> bool {
+        self.running
+            || self.settled_count != prev.settled_count
+            || self.last_tool != prev.last_tool
+            || self.text_tail != prev.text_tail
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitEnd {
+    Continue,
+    IdleDone,
+    Terminal,
+    Stopped,
+    TimeoutAbs,
+    TimeoutInactivity,
+}
+
+/// Pure idle-wait policy (fake-clock friendly: callers pass elapsed times).
+/// Terminal/idle wins over timeouts; the absolute cap wins over inactivity.
+fn decide_wait(
+    terminal: bool,
+    idle_done: bool,
+    abs_elapsed_secs: f64,
+    idle_elapsed_secs: f64,
+    abs_timeout_secs: f64,
+    inactivity_secs: f64,
+) -> WaitEnd {
+    if terminal {
+        return WaitEnd::Terminal;
+    }
+    if idle_done {
+        return WaitEnd::IdleDone;
+    }
+    if abs_elapsed_secs >= abs_timeout_secs {
+        return WaitEnd::TimeoutAbs;
+    }
+    if idle_elapsed_secs >= inactivity_secs {
+        return WaitEnd::TimeoutInactivity;
+    }
+    WaitEnd::Continue
+}
+
+struct WaitOutcome {
+    status: Value,
+    end: WaitEnd,
+    saw_running: bool,
+}
+
+/// Activity-based wait for the Pi session to go idle after send.
+///
+/// Two budgets: an absolute cap (`abs_timeout_secs`, default 1h or the job's
+/// `timeout_secs`) and an inactivity budget (`inactivity_secs`, default 10min
+/// with no observable progress). While the agent is `running` or its
+/// `text_tail` / `last_tool` / `settled_count` keeps changing, the inactivity
+/// deadline keeps refreshing — a long coding run is never failed just for
+/// being slow. Lease renewals + progress events continue as today.
 async fn wait_until_idle_with_events(
     api: &ApiClient,
     rt: &DirRuntime,
     job_id: &str,
-    timeout_secs: f64,
+    abs_timeout_secs: f64,
+    inactivity_secs: f64,
     settled_before: Option<i64>,
     stop: &AtomicBool,
-) -> Value {
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
+) -> WaitOutcome {
+    let start = Instant::now();
+    let mut last_progress_at = start;
+    let mut prev = PiProgress::default();
     let mut last = json!({});
     let mut saw_running = false;
     let mut last_event_at = Instant::now() - Duration::from_secs(3600);
     let mut last_tail = String::new();
     let mut last_tool: Option<String> = None;
 
-    while Instant::now() < deadline {
-        if stop.load(Ordering::Relaxed) { break; }
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return WaitOutcome { status: last, end: WaitEnd::Stopped, saw_running };
+        }
         let st = get_status(rt).await.unwrap_or_else(|| json!({}));
         last = st.clone();
         let inner = status_inner(&st);
@@ -510,8 +607,15 @@ async fn wait_until_idle_with_events(
         let settled = inner.get("settled_count").and_then(|v| v.as_i64());
         let tool = inner.get("last_tool").and_then(|v| v.as_str()).map(|s| s.to_string());
         let text_tail = inner.get("text_tail").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if state == Some("running") { saw_running = true; }
+        let cur = PiProgress::from_status(&st);
+        if cur.running {
+            saw_running = true;
+        }
         let now = Instant::now();
+        if cur.advanced_since(&prev) {
+            last_progress_at = now;
+        }
+        prev = cur;
         if now.duration_since(last_event_at).as_secs_f64() >= rt.event_interval_secs {
             if let Some(ref t) = tool {
                 if last_tool.as_ref() != Some(t) {
@@ -527,19 +631,23 @@ async fn wait_until_idle_with_events(
             api.renew_lease(job_id).await;
             last_event_at = now;
         }
-        if matches!(state, Some("error" | "dead" | "stopped")) { return last; }
-        if state == Some("idle") {
-            let bumped = matches!((settled, settled_before), (Some(s), Some(b)) if s > b);
-            if bumped || saw_running { return last; }
+        let terminal = matches!(state, Some("error" | "dead" | "stopped"));
+        let bumped = matches!((settled, settled_before), (Some(s), Some(b)) if s > b);
+        let idle_done = state == Some("idle") && (bumped || saw_running);
+        let end = decide_wait(
+            terminal,
+            idle_done,
+            start.elapsed().as_secs_f64(),
+            last_progress_at.elapsed().as_secs_f64(),
+            abs_timeout_secs,
+            inactivity_secs,
+        );
+        match end {
+            WaitEnd::Continue => {}
+            _ => return WaitOutcome { status: last, end, saw_running },
         }
         sleep(Duration::from_secs_f64(POLL_STATUS_INTERVAL)).await;
     }
-    if let Value::Object(ref mut m) = last {
-        m.insert("_wait_timeout".into(), Value::Bool(true));
-    } else {
-        last = json!({"_wait_timeout": true});
-    }
-    last
 }
 
 async fn run_via_pi(api: &ApiClient, rt: &DirRuntime, job: &Job, stop: &AtomicBool) -> (bool, Option<Value>, Option<String>) {
@@ -552,7 +660,10 @@ async fn run_via_pi(api: &ApiClient, rt: &DirRuntime, job: &Job, stop: &AtomicBo
     let before = get_status(rt).await.unwrap_or_else(|| json!({}));
     let settled_before = status_inner(&before).get("settled_count").and_then(|v| v.as_i64());
     let prompt = build_pi_prompt(job);
-    let timeout_secs = job.timeout_secs.filter(|&t| t > 0).map(|t| t as f64).unwrap_or(DEFAULT_PI_TIMEOUT as f64);
+    // Absolute wait cap: explicit job timeout wins, else the 1h default.
+    // The inactivity budget (no observable progress) applies on top.
+    let abs_timeout_secs = job.timeout_secs.filter(|&t| t > 0).map(|t| t as f64).unwrap_or(DEFAULT_PI_ABS_TIMEOUT as f64);
+    let inactivity_secs = DEFAULT_PI_INACTIVITY_SECS;
     // Prompt file lives in the OS temp dir — never litter the project tree.
     let prompt_path = std::env::temp_dir().join(format!("host-ops-{}-prompt.txt", job.id));
     if let Err(e) = tokio::fs::write(&prompt_path, prompt.as_bytes()).await {
@@ -574,18 +685,24 @@ async fn run_via_pi(api: &ApiClient, rt: &DirRuntime, job: &Job, stop: &AtomicBo
     };
     info!(delivery = %delivery, label, "pi_svc send");
     api.post_event(&job_id, "status", Some(&format!("pi_svc send ({delivery})")), Some(json!({"delivery_mode": delivery}))).await;
-    let out = pi_svc(rt, &send_args, (timeout_secs + 30.0).min(120.0)).await;
+    let out = pi_svc(rt, &send_args, (abs_timeout_secs + 30.0).min(120.0)).await;
     if out.code != 0 {
         let _ = tokio::fs::remove_file(&prompt_path).await;
         let err = if out.stderr.is_empty() { out.stdout } else { out.stderr };
         return (false, None, Some(format!("pi_svc send failed ({}): {err}", out.code)));
     }
-    let final_st = wait_until_idle_with_events(api, rt, &job_id, timeout_secs, settled_before, stop).await;
+    let outcome = wait_until_idle_with_events(api, rt, &job_id, abs_timeout_secs, inactivity_secs, settled_before, stop).await;
+    let final_st = outcome.status;
     let inner_f = status_inner(&final_st);
     let text_tail = inner_f.get("text_tail").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let tout = pi_svc(rt, &["tail", session, "--text", "-n", "40"], 30.0).await;
     let text_log = if tout.code == 0 { tout.stdout } else { String::new() };
-    let wait_timeout = final_st.get("_wait_timeout").and_then(|v| v.as_bool()).unwrap_or(false);
+    let wait_timeout = matches!(outcome.end, WaitEnd::TimeoutAbs | WaitEnd::TimeoutInactivity);
+    let timeout_kind = match outcome.end {
+        WaitEnd::TimeoutAbs => Some("absolute"),
+        WaitEnd::TimeoutInactivity => Some("inactivity"),
+        _ => None,
+    };
     let state_f = inner_f.get("state").and_then(|v| v.as_str());
     let result = truncate_result(json!({
         "via": "pi_svc",
@@ -599,6 +716,7 @@ async fn run_via_pi(api: &ApiClient, rt: &DirRuntime, job: &Job, stop: &AtomicBo
         "text_tail": text_tail,
         "text_log_tail": tail_chars(&text_log, 8000),
         "wait_timeout": wait_timeout,
+        "timeout_kind": timeout_kind,
         "send_stdout": clip_chars(&out.stdout, 2000),
     }));
     let mut ok = true;
@@ -606,9 +724,31 @@ async fn run_via_pi(api: &ApiClient, rt: &DirRuntime, job: &Job, stop: &AtomicBo
     if matches!(state_f, Some("error" | "dead")) {
         ok = false;
         err_msg = Some(inner_f.get("error").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| format!("session state={state_f:?}")));
-    } else if wait_timeout {
+    } else if outcome.end == WaitEnd::TimeoutAbs {
+        // Never claim success on timeout — but say plainly the agent was
+        // still working, so this reads as "needs longer", not "task failed".
         ok = false;
-        err_msg = Some(format!("timed out waiting for idle after {timeout_secs}s"));
+        err_msg = Some(format!(
+            "absolute Pi wait timeout after {}s: agent still {}",
+            abs_timeout_secs as u64,
+            state_f.unwrap_or("unknown"),
+        ));
+    } else if outcome.end == WaitEnd::TimeoutInactivity {
+        ok = false;
+        err_msg = Some(if !outcome.saw_running && state_f != Some("idle") {
+            format!(
+                "Pi inactivity timeout after {}s: send accepted but agent never started (state={})",
+                inactivity_secs as u64,
+                state_f.unwrap_or("unknown"),
+            )
+        } else {
+            format!(
+                "Pi inactivity timeout after {}s with no progress (state={}; absolute cap {}s)",
+                inactivity_secs as u64,
+                state_f.unwrap_or("unknown"),
+                abs_timeout_secs as u64,
+            )
+        });
     }
     let _ = tokio::fs::remove_file(&prompt_path).await;
     (ok, Some(result), err_msg)
@@ -699,5 +839,140 @@ mod tests {
     fn reject_fast_model() {
         assert!(reject_fast("opencode-go", "muse-spark").is_ok());
         assert!(reject_fast("x", "foo-fast").is_err());
+    }
+
+    fn progress(state: &str, tail: &str, tool: Option<&str>, settled: Option<i64>) -> PiProgress {
+        let mut inner = serde_json::Map::new();
+        inner.insert("state".into(), Value::String(state.into()));
+        inner.insert("text_tail".into(), Value::String(tail.into()));
+        if let Some(t) = tool {
+            inner.insert("last_tool".into(), Value::String(t.into()));
+        }
+        if let Some(s) = settled {
+            inner.insert("settled_count".into(), Value::Number(s.into()));
+        }
+        PiProgress::from_status(&Value::Object({
+            let mut o = serde_json::Map::new();
+            o.insert("status".into(), Value::Object(inner));
+            o
+        }))
+    }
+
+    #[test]
+    fn progress_advances_on_running_or_changed_output() {
+        let empty = PiProgress::default();
+        // Idle with no output change is not progress.
+        let idle = progress("idle", "", None, None);
+        assert!(!idle.advanced_since(&empty));
+        assert!(!idle.advanced_since(&idle));
+        // Running alone counts — a thinking agent emitting nothing is working.
+        assert!(progress("running", "", None, None).advanced_since(&idle));
+        // New text / tool / settled count counts even when not running.
+        assert!(progress("idle", "ab", None, None).advanced_since(&idle));
+        assert!(progress("idle", "", Some("wiki_observe"), None).advanced_since(&idle));
+        assert!(progress("idle", "", None, Some(1)).advanced_since(&progress("idle", "", None, Some(0))));
+        // Identical snapshot twice is not progress.
+        let same = progress("idle", "ab", Some("wiki_observe"), Some(1));
+        assert!(!same.advanced_since(&same));
+    }
+
+    #[test]
+    fn wait_policy_branches() {
+        let abs = 3600.0;
+        let inact = 600.0;
+        // Long run, still working near the absolute cap → keep waiting.
+        // (The old flat-300s wall clock failed exactly this case.)
+        assert_eq!(
+            decide_wait(false, false, 3500.0, 5.0, abs, inact),
+            WaitEnd::Continue
+        );
+        // Silence past the inactivity budget → inactivity timeout.
+        assert_eq!(
+            decide_wait(false, false, 100.0, 600.0, abs, inact),
+            WaitEnd::TimeoutInactivity
+        );
+        // Absolute cap exceeded while still running → absolute timeout.
+        assert_eq!(
+            decide_wait(false, false, 3600.0, 5.0, abs, inact),
+            WaitEnd::TimeoutAbs
+        );
+        // Idle after running → success, even at the deadline.
+        assert_eq!(
+            decide_wait(false, true, 3600.0, 600.0, abs, inact),
+            WaitEnd::IdleDone
+        );
+        // Terminal state beats timeouts.
+        assert_eq!(
+            decide_wait(true, false, 3600.0, 600.0, abs, inact),
+            WaitEnd::Terminal
+        );
+    }
+
+    /// Fold a status timeline through the same progress/idle accounting the
+    /// wait loop uses (fake clock): replicates the b76169c6 repro — a slow
+    /// coding run with occasional output must not time out at old 300s.
+    #[test]
+    fn wait_policy_survives_slow_coding_run() {
+        let abs = 3600.0;
+        let inact = 600.0;
+        // (state, tail, tool, settled, dt_secs)
+        let timeline: Vec<(&str, &str, Option<&str>, Option<i64>, f64)> = vec![
+            ("idle", "", None, None, 2.0), // send just dispatched
+            ("running", "step 1", None, None, 120.0),
+            ("running", "step 1", Some("wiki_observe"), None, 300.0),
+            ("running", "step 2: editing", Some("wiki_observe"), None, 590.0),
+            // Long quiet stretch, still running → progress, timer refreshes.
+            ("running", "step 2: editing", Some("wiki_observe"), None, 590.0),
+            ("idle", "done", Some("wiki_observe"), Some(1), 5.0),
+        ];
+        let mut prev = PiProgress::default();
+        let mut saw_running = false;
+        let mut abs_e = 0.0;
+        let mut idle_e = 0.0;
+        let mut end = WaitEnd::Continue;
+        for (state, tail, tool, settled, dt) in &timeline {
+            let cur = progress(state, tail, *tool, *settled);
+            if cur.running {
+                saw_running = true;
+            }
+            if cur.advanced_since(&prev) {
+                idle_e = 0.0;
+            } else {
+                idle_e += dt;
+            }
+            prev = cur;
+            abs_e += dt;
+            let idle_done = *state == "idle" && saw_running;
+            end = decide_wait(false, idle_done, abs_e, idle_e, abs, inact);
+            if end != WaitEnd::Continue {
+                break;
+            }
+        }
+        assert!(abs_e > 300.0, "timeline must outlast the old flat killer");
+        assert_eq!(end, WaitEnd::IdleDone);
+    }
+
+    #[test]
+    fn wait_policy_stuck_send_times_out_inactivity() {
+        // Steer accepted but the agent never starts: idle + no output.
+        let mut prev = PiProgress::default();
+        let mut abs_e = 0.0;
+        let mut idle_e = 0.0;
+        let mut end = WaitEnd::Continue;
+        for _ in 0..7 {
+            let cur = progress("idle", "", None, None);
+            if cur.advanced_since(&prev) {
+                idle_e = 0.0;
+            } else {
+                idle_e += 100.0;
+            }
+            prev = cur;
+            abs_e += 100.0;
+            end = decide_wait(false, false, abs_e, idle_e, 3600.0, 600.0);
+            if end != WaitEnd::Continue {
+                break;
+            }
+        }
+        assert_eq!(end, WaitEnd::TimeoutInactivity);
     }
 }

@@ -98,6 +98,24 @@ curl -sS http://127.0.0.1:8787/v1/agents \
 | **`steer`** (default) | `pi_svc send --steer` — interrupt/redirect current turn |
 | **`queue`** | idle → normal `send`; busy → `send --follow-up` |
 
+### Pi idle wait (activity-based)
+
+After `send`, the worker waits for the Pi session to go idle with **two
+budgets** (see `src/bin/worker/runtime.rs`):
+
+- **Absolute cap** — the job's `timeout_secs` if set, else **3600s (1h)**.
+  A long coding/`act` run never fails just for being slow.
+- **Inactivity budget** — **600s (10 min)** with no observable progress
+  (`running` state, or `text_tail` / `last_tool` / `settled_count` changing).
+  While the agent works, the deadline keeps refreshing.
+
+A timeout while the agent is still `running` fails the job but says so
+plainly (`absolute Pi wait timeout after …: agent still running`), and the
+result keeps `wait_timeout`, `timeout_kind` (`absolute`/`inactivity`), and
+tails. A send that never starts the agent fails as an inactivity timeout
+with a distinct message. Pass `--timeout` (`host-ops job create` / `steer`)
+only when a job needs more than the 1h default.
+
 ## Feedback events
 
 While a job is `running`, the claiming agent may POST incremental events:

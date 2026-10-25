@@ -53,4 +53,13 @@ it keeps flowing while a job runs) plus **one long-poll** for all bound
 agents, and still executes only **one job at a time**. Empty worker token =
 legacy per-directory mode (unchanged).
 
+## Pi idle wait
+
+After `pi_svc send`, the worker waits for the session to go idle with two
+budgets: an **absolute cap** (the job's `timeout_secs`, else **1h**) and an
+**inactivity budget** (**10 min** with no `running` state / output change).
+Long coding runs keep their lease renewed and stay alive while they work;
+a timeout while still `running` is reported as a wait timeout, not a task
+failure. Needs more than 1h? Pass `--timeout` on `host-ops job create` / `steer`.
+
 Never uses Cursor CloudAgent / Fast.
