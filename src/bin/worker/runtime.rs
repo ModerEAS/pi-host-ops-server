@@ -1,5 +1,6 @@
 //! Job execution: local shell + owned `pi --mode rpc` children (no pi_svc).
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, Notify};
 use tokio::process::Command;
 use tokio::time::{sleep, timeout};
 use tracing::info;
@@ -565,6 +566,10 @@ pub struct PiSession {
     stdin: Mutex<Option<ChildStdin>>,
     pending: Mutex<HashMap<String, oneshot::Sender<Value>>>,
     stderr_tail: Mutex<String>,
+    /// Fires whenever the drain folds a new record (or marks death), so the
+    /// wait loop wakes the moment the turn settles instead of on the next
+    /// 2s tick. Completion = one prompt result upload, no extra dance.
+    changed: Notify,
 }
 
 impl PiSession {
@@ -597,6 +602,7 @@ impl PiSession {
             stdin: Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
             stderr_tail: Mutex::new(String::new()),
+            changed: Notify::new(),
         });
         let s = sess.clone();
         tokio::spawn(async move { s.drain_stdout(stdout).await });
@@ -676,6 +682,8 @@ impl PiSession {
                 let _ = tx.send(rec);
             }
         }
+        // Wake the wait loop: settle/exit must upload the result at once.
+        self.changed.notify_waiters();
     }
 
     async fn mark_dead(&self, why: &str) {
@@ -694,6 +702,8 @@ impl PiSession {
         for (_, tx) in pending.drain() {
             let _ = tx.send(json!({"type": "response", "success": false, "error": "pi child exited"}));
         }
+        // Wake the wait loop too: child exit uploads the result at once.
+        self.changed.notify_waiters();
     }
 
     async fn write_json(&self, v: &Value) -> Result<()> {
@@ -708,6 +718,12 @@ impl PiSession {
 
     async fn check(&self) -> ChildAlive {
         classify_wait(self.child.lock().await.try_wait())
+    }
+
+    /// Subscribe to drain updates. Create the future *before* snapshotting
+    /// so no settle/exit observed in between is ever missed.
+    fn changed_notified(&self) -> impl Future<Output = ()> + '_ {
+        self.changed.notified()
     }
 
     /// Liveness source of truth: the OS process itself.
@@ -967,6 +983,9 @@ async fn wait_until_idle_with_events(
         if stop.load(Ordering::Relaxed) {
             return WaitOutcome { status: last, end: WaitEnd::Stopped, saw_running };
         }
+        // Subscribe before snapshotting so a settle/exit landing in between
+        // still wakes us: completion uploads the result at once.
+        let wake = sess.changed_notified();
         // The OS process is the source of truth: a dead child ends the wait
         // as a failure even if the last snapshot looked healthy.
         let alive = sess.check().await;
@@ -1021,7 +1040,12 @@ async fn wait_until_idle_with_events(
             WaitEnd::Continue => {}
             _ => return WaitOutcome { status: last, end, saw_running },
         }
-        sleep(Duration::from_secs_f64(POLL_STATUS_INTERVAL)).await;
+        // Event-driven wakeup (settle/exit/progress) with the 2s tick only
+        // as a fallback — no post-settle aliveness dance, just upload.
+        tokio::select! {
+            _ = wake => {}
+            _ = sleep(Duration::from_secs_f64(POLL_STATUS_INTERVAL)) => {}
+        }
     }
 }
 
@@ -1434,5 +1458,104 @@ mod tests {
     fn exited_process_is_not_alive() {
         let status = std::process::Command::new("cmd").args(["/C", "exit 3"]).status().unwrap();
         assert_eq!(classify_wait(Ok(Some(status))), ChildAlive::Exited(Some(3)));
+    }
+
+    /// End-to-end through a stub `pi --mode rpc` (python3, unbuffered, no
+    /// model): one prompt → accept → lifecycle → agent_settled, and the wait
+    /// loop finishes promptly via the drain wakeup (not the 2s tick).
+    /// Unix-only (Windows runs the pure unit tests); needs python3.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rpc_settle_completes_wait_promptly() {
+        let dir = std::env::temp_dir().join(format!("host-ops-rpc-stub-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("fake-pi");
+        // NOTE: plain sh `printf` block-buffers into a pipe (output would
+        // only flush on exit), so the stub is python with explicit flushes.
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import sys, json, time
+def readline():
+    line = sys.stdin.readline()
+    if not line:
+        sys.exit(0)
+    return line
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+# Phase 1: accept the first prompt and start working.
+line1 = readline()
+try:
+    id1 = json.loads(line1).get("id", "p0")
+except Exception:
+    id1 = "p0"
+emit({"id": id1, "type": "response", "command": "prompt", "success": True, "data": {"disposition": "started"}})
+emit({"type": "agent_start"})
+# Phase 2: the follow-up prompt settles the turn.
+line2 = readline()
+try:
+    id2 = json.loads(line2).get("id", "p0")
+except Exception:
+    id2 = "p0"
+emit({"id": id2, "type": "response", "command": "prompt", "success": True, "data": {"disposition": "started"}})
+emit({"type": "agent_settled"})
+time.sleep(60)
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let sessions = PiSessions::default();
+        let rt = DirRuntime {
+            host_ops_url: "http://127.0.0.1:9".into(),
+            agent_token: "t".into(),
+            agent_id: "a".into(),
+            work_dir: dir.clone(),
+            pi_bin: Some(stub),
+            pi_session: format!("test-{}", Uuid::new_v4()),
+            provider: "opencode-go".into(),
+            model: "muse-spark-1.3-contributor".into(),
+            event_interval_secs: 0.01,
+        };
+        let sess = sessions.ensure(&rt).await.expect("spawn stub pi");
+        assert!(sess.is_alive().await);
+        let settled_before = Some(sess.snapshot().await.settled_count);
+        let accept = sess.send_prompt("p1", "hello", Some("steer")).await.expect("accept");
+        assert!(accept.success);
+        assert_eq!(accept.disposition.as_deref(), Some("started"));
+
+        // Drain wakeup wiring: a record observed after subscribing fires it
+        // (use turn_end: observable via last_event, no state flip).
+        let wake = sess.changed_notified();
+        sess.on_line(r#"{"type":"turn_end"}"#).await;
+        tokio::time::timeout(Duration::from_secs(2), wake).await.expect("notify on record");
+        assert_eq!(sess.snapshot().await.last_event.as_deref(), Some("turn_end"));
+
+        // Settle the turn *while* the wait runs: the follow-up prompt lands
+        // mid-wait, the drain wakes the loop, and completion uploads at once
+        // (event-driven, not on the next 2s tick). No post-settle dance.
+        let sess2 = sess.clone();
+        let p2 = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            sess2.send_prompt("p2", "follow-up", Some("followUp")).await
+        });
+        let api = ApiClient::new("http://127.0.0.1:9", "t", "a").unwrap();
+        let stop = AtomicBool::new(false);
+        let t0 = std::time::Instant::now();
+        let outcome = wait_until_idle_with_events(
+            &api, &sess, "job-test", 30.0, 10.0, 0.01, settled_before, &stop,
+        )
+        .await;
+        let accept2 = p2.await.unwrap().expect("p2 accept");
+        assert!(accept2.success);
+        assert_eq!(outcome.end, WaitEnd::IdleDone);
+        assert!(outcome.saw_running);
+        assert!(t0.elapsed() < Duration::from_secs(8), "settle must upload promptly");
+
+        sessions.shutdown_all().await;
+        assert!(!sess.is_alive().await);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
