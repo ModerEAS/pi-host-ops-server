@@ -19,6 +19,8 @@ Download from GitHub Releases:
 powershell -ExecutionPolicy Bypass -File scripts\install-worker.ps1 -Run
 ```
 
+Windows 上不要配 `pi_svc`（那是云电脑/box 专属）；worker 直连 `pi --mode rpc`。`where pi` 能找到 npm 的 `pi.cmd` 即可，worker 会自动走 `cmd /C` 启动并保持 stdin/stdout 管道；若 PATH 里没有 pi，可把 `pi_bin` 指到绝对路径（`pi.exe` 或 `pi.cmd` 均可，优先用 `.exe`）。
+
 Then open the WebUI, paste dispatcher token, add project directories.
 
 ## Dev only
