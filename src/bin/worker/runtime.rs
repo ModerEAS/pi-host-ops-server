@@ -1,7 +1,7 @@
 //! Job execution: local shell + owned `pi --mode rpc` children (no pi_svc).
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -431,6 +431,123 @@ fn spawn_params(rt: &DirRuntime) -> SpawnParams {
     }
 }
 
+/// How to start the pi child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PiLaunch {
+    /// Execute directly: `bin --mode rpc ...` (Unix, or a real .exe).
+    Direct(PathBuf),
+    /// Windows batch shim: `cmd /C <shim> --mode rpc ...` with stdio pipes
+    /// inherited, so RPC JSONL flows unchanged.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    CmdShim(PathBuf),
+}
+
+/// Resolve the configured `pi_bin` (or default `pi`) into a launch plan.
+/// Off Windows this is a passthrough (execvp resolves PATH); Windows
+/// CreateProcess does NOT apply PATHEXT, so bare `pi` must be resolved here.
+fn resolve_pi_launch(configured: Option<&PathBuf>) -> Result<PiLaunch> {
+    let raw = configured
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "pi".into());
+    #[cfg(windows)]
+    {
+        resolve_pi_windows(&raw)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(PiLaunch::Direct(PathBuf::from(raw)))
+    }
+}
+
+/// Classify an explicit pi path: batch shims must go through `cmd /C`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn classify_pi_path(p: &Path) -> Result<PiLaunch> {
+    match p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+    {
+        Some(e) if e == "cmd" || e == "bat" => Ok(PiLaunch::CmdShim(p.to_path_buf())),
+        Some(e) if e == "ps1" => {
+            bail!("pi_bin points at a .ps1 script, which cannot be spawned directly; point it at pi.exe or the npm pi.cmd instead: {}", p.display())
+        }
+        _ => Ok(PiLaunch::Direct(p.to_path_buf())),
+    }
+}
+
+/// PATHEXT extension order with .exe/.com first (task requirement), deduped
+/// case-insensitively. Pure for unit tests; reads the real env on Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn pathext_order_from(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |ext: &str| {
+        let mut e = ext.trim().to_string();
+        if e.is_empty() {
+            return;
+        }
+        if !e.starts_with('.') {
+            e.insert(0, '.');
+        }
+        if seen.insert(e.to_ascii_lowercase()) {
+            out.push(e);
+        }
+    };
+    // Prefer real executables over batch shims.
+    push(".exe");
+    push(".com");
+    for ext in raw.split(';') {
+        push(ext);
+    }
+    out
+}
+
+#[cfg(windows)]
+fn pathext_order() -> Vec<String> {
+    pathext_order_from(
+        &std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into()),
+    )
+}
+
+/// Search `dirs` (PATH order) for `name` + each extension. Extension-major so
+/// a `pi.exe` anywhere on PATH wins over a `pi.cmd` (per requirement),
+/// while staying within a single PATH entry's preference implicitly.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn find_on_path(name: &str, dirs: &[PathBuf], exts: &[String]) -> Option<PathBuf> {
+    for ext in exts {
+        for dir in dirs {
+            let cand = dir.join(format!("{name}{ext}"));
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// Windows: resolve bare `pi` via PATH + PATHEXT (prefer .exe, else .cmd/.bat);
+/// explicit paths (containing a separator) are honored as given.
+/// `cmd /C` would find the same entries, but resolving here gives a clear
+/// "not found" error and lets us skip the cmd wrapper for real exes.
+#[cfg(windows)]
+fn resolve_pi_windows(bin: &str) -> Result<PiLaunch> {
+    if bin.contains(|c| c == '/' || c == '\\') {
+        let p = PathBuf::from(bin);
+        if !p.is_file() {
+            bail!("pi_bin does not exist: {} (set pi_bin to the absolute path of pi.exe or the npm pi.cmd)", p.display());
+        }
+        return classify_pi_path(&p);
+    }
+    let dirs: Vec<PathBuf> = std::env::split_paths(
+        &std::env::var("PATH").unwrap_or_default(),
+    )
+    .collect();
+    match find_on_path(bin, &dirs, &pathext_order()) {
+        Some(p) => classify_pi_path(&p),
+        None => bail!("pi not found on PATH (checked PATHEXT); install pi, or set pi_bin to the absolute path of pi.exe / npm pi.cmd, e.g. %APPDATA%\\npm\\pi.cmd"),
+    }
+}
+
 /// Liveness of the owned child. `try_wait` is the source of truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildAlive {
@@ -576,7 +693,21 @@ impl PiSession {
     async fn spawn(rt: &DirRuntime) -> Result<Arc<Self>> {
         rt.validate_model()?;
         let params = spawn_params(rt);
-        let mut cmd = Command::new(&params.bin);
+        let launch = resolve_pi_launch(rt.pi_bin.as_ref())?;
+        let mut cmd = match &launch {
+            PiLaunch::Direct(bin) => Command::new(bin),
+            PiLaunch::CmdShim(shim) => {
+                // cmd.exe resolves PATHEXT itself, but we pre-resolved to an
+                // absolute shim for a clear error. Args stay separate argv
+                // elements: Rust quotes the shim path if spaced, and cmd's
+                // two-quote rule then runs it directly with the rest as args.
+                // Stdio pipes are inherited through cmd into the batch child,
+                // so RPC JSONL flows unchanged.
+                let mut c = Command::new("cmd");
+                c.arg("/C").arg(shim);
+                c
+            }
+        };
         cmd.arg("--mode")
             .arg("rpc")
             .arg("--provider")
@@ -591,7 +722,10 @@ impl PiSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = cmd.spawn().with_context(|| format!("spawn {}", params.bin))?;
+        let mut child = cmd.spawn().with_context(|| match &launch {
+            PiLaunch::Direct(bin) => format!("spawn {}", bin.display()),
+            PiLaunch::CmdShim(shim) => format!("spawn cmd /C {}", shim.display()),
+        })?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().context("pi stdout")?;
         let stderr = child.stderr.take().context("pi stderr")?;
@@ -777,9 +911,30 @@ impl PiSession {
         self.stdin.lock().await.take(); // EOF for a deaf child
         let mut child = self.child.lock().await;
         if tokio::time::timeout(Duration::from_secs(10), child.wait()).await.is_err() {
-            let _ = child.kill().await;
+            self.kill_child(&mut child).await;
         }
         self.state.lock().await.state = "stopped".into();
+    }
+
+    /// Last-resort kill. On Windows the child may be `cmd.exe` wrapping the
+    /// real pi (node grandchild): plain kill would orphan it, so kill the
+    /// whole tree with taskkill /T instead.
+    async fn kill_child(&self, child: &mut Child) {
+        #[cfg(windows)]
+        {
+            let pid = child.id();
+            if let Some(pid) = pid {
+                let _ = Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .output()
+                    .await;
+                return;
+            }
+        }
+        let _ = child.kill().await;
     }
 }
 
@@ -1557,5 +1712,77 @@ time.sleep(60)
         sessions.shutdown_all().await;
         assert!(!sess.is_alive().await);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pathext_prefers_exe_and_dedups() {
+        let exts = pathext_order_from(".COM;.EXE;.BAT;.CMD;.VBS;.com");
+        assert_eq!(&exts[..2], &[".exe".to_string(), ".com".to_string()]);
+        assert!(exts.contains(&".CMD".to_string()));
+        // .com appears once despite the lowercase duplicate.
+        assert_eq!(exts.iter().filter(|e| e.eq_ignore_ascii_case(".com")).count(), 1);
+        // Missing/empty PATHEXT still yields a usable order.
+        let fallback = pathext_order_from("");
+        assert_eq!(fallback, vec![".exe".to_string(), ".com".to_string()]);
+    }
+
+    #[test]
+    fn classify_pi_path_routes_shims_through_cmd() {
+        assert_eq!(
+            classify_pi_path(Path::new("C:\\npm\\pi.cmd")).unwrap(),
+            PiLaunch::CmdShim(PathBuf::from("C:\\npm\\pi.cmd"))
+        );
+        assert_eq!(
+            classify_pi_path(Path::new("C:\\npm\\pi.bat")).unwrap(),
+            PiLaunch::CmdShim(PathBuf::from("C:\\npm\\pi.bat"))
+        );
+        assert_eq!(
+            classify_pi_path(Path::new("C:\\tools\\pi.exe")).unwrap(),
+            PiLaunch::Direct(PathBuf::from("C:\\tools\\pi.exe"))
+        );
+        assert!(classify_pi_path(Path::new("C:\\tools\\run.ps1")).is_err());
+    }
+
+    /// Extension-major search: a pi.exe anywhere beats a pi.cmd, so the
+    /// worker never wraps a real executable in cmd.exe.
+    #[test]
+    fn find_on_path_prefers_exe_over_cmd() {
+        let root = std::env::temp_dir().join(format!("host-ops-pathext-{}", Uuid::new_v4()));
+        let early = root.join("early");
+        let late = root.join("late");
+        std::fs::create_dir_all(&early).unwrap();
+        std::fs::create_dir_all(&late).unwrap();
+        std::fs::write(early.join("pi.cmd"), "@echo off\n").unwrap();
+        std::fs::write(late.join("pi.exe"), "MZ").unwrap();
+        let exts = pathext_order_from(".COM;.EXE;.BAT;.CMD");
+        assert_eq!(
+            find_on_path("pi", &[early.clone(), late.clone()], &exts),
+            Some(late.join("pi.exe"))
+        );
+        // Same directory: still the .exe.
+        std::fs::write(early.join("pi.exe"), "MZ").unwrap();
+        assert_eq!(
+            find_on_path("pi", &[early.clone(), late.clone()], &exts),
+            Some(early.join("pi.exe"))
+        );
+        // Nothing present: None (caller bails with a helpful message).
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(find_on_path("pi", &[empty.clone()], &exts), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Off Windows the resolver is a passthrough (execvp resolves PATH).
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_pi_launch_passthrough_off_windows() {
+        assert_eq!(
+            resolve_pi_launch(None).unwrap(),
+            PiLaunch::Direct(PathBuf::from("pi"))
+        );
+        assert_eq!(
+            resolve_pi_launch(Some(&PathBuf::from("/opt/pi/bin/pi"))).unwrap(),
+            PiLaunch::Direct(PathBuf::from("/opt/pi/bin/pi"))
+        );
     }
 }
