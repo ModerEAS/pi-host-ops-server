@@ -55,6 +55,9 @@ it keeps flowing while a job runs) plus **one long-poll** for all bound
 agents, and still executes only **one job at a time**. Empty worker token =
 legacy per-directory mode (unchanged).
 
+`scripts/install-worker.ps1` / `scripts/install-worker.sh` do these three
+steps automatically when given a dispatcher token + host-ops URL.
+
 ## Pi idle wait
 
 After the RPC prompt is accepted, the worker waits for the session to go idle with two

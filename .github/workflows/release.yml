@@ -243,8 +243,11 @@ jobs:
             ### Install worker (Windows)
 
             ```powershell
-            powershell -ExecutionPolicy Bypass -File scripts\install-worker.ps1 -Repo ModerRAS/pi-host-ops-server -Version ${{ steps.tag.outputs.tag }} -AgentToken '<token>' -HostOpsUrl 'https://your-server:8787' -Run
+            powershell -ExecutionPolicy Bypass -File scripts\install-worker.ps1 -Repo ModerRAS/pi-host-ops-server -Version ${{ steps.tag.outputs.tag }} -DispatcherToken '<token>' -HostOpsUrl 'https://your-server:8787' -Run
             ```
+
+            With `-DispatcherToken`/`-HostOpsUrl` the script also enrolls multiplexed mode
+            (creates the worker, saves `worker_token`, binds registered dirs).
 
             Or after cloning this repo at the release tag, run the script from `scripts/`.
 
@@ -252,8 +255,11 @@ jobs:
 
             ```bash
             ./scripts/install-worker.sh --repo ModerRAS/pi-host-ops-server --version ${{ steps.tag.outputs.tag }} \
-              --agent-token '<token>' --host-ops-url 'https://your-server:8787' --run
+              --dispatcher-token '<token>' --host-ops-url 'https://your-server:8787' --run
             ```
+
+            Same auto-enroll as Windows: with token+URL the script creates the worker,
+            saves `worker_token`, and binds registered dirs.
 
             ### Install dispatcher CLI (host-ops)
 
