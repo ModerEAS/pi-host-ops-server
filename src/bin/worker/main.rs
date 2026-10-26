@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::collections::HashSet;
 
 use anyhow::{bail, Context, Result};
 use tracing::{error, info, warn};
@@ -99,10 +100,21 @@ async fn main() -> Result<()> {
     let mut last_hb: std::collections::HashMap<String, Instant> = std::collections::HashMap::new();
     // Background batch-heartbeat task while multiplexed mode is active.
     let mut hb_task: Option<tokio::task::JoinHandle<()>> = None;
+    // Owned `pi --mode rpc` children, one per directory session name.
+    let pi_sessions = Arc::new(runtime::PiSessions::default());
 
     while !stop.load(Ordering::Relaxed) {
         // Snapshot config each tick so WebUI edits apply without restart.
         let snapshot = state.cfg.lock().await.clone();
+        // Drop pi children for removed/disabled/renamed dirs (clean shutdown).
+        // Never runs mid-job: both branches below block on execute_job.
+        let active: HashSet<String> = snapshot
+            .directories
+            .iter()
+            .filter(|d| d.enabled)
+            .map(|d| d.pi_session.clone().unwrap_or_else(|| default_session_for(&d.label, &d.id)))
+            .collect();
+        pi_sessions.retain_active(&active).await;
         // Worker multiplexed mode: one batch heartbeat (background task) + one
         // poll for all bound agents. Serial execution holds because
         // execute_job blocks this loop — no second poll starts mid-job.
@@ -113,7 +125,7 @@ async fn main() -> Result<()> {
                 info!("worker multiplexed mode: batch heartbeat + single poll");
                 hb_task = Some(spawn_worker_heartbeat_task(state.clone()));
             }
-            if let Err(e) = run_worker_mux_step(&state, &snapshot, &stop).await {
+            if let Err(e) = run_worker_mux_step(&state, &snapshot, &pi_sessions, &stop).await {
                 warn!(error = %e, "worker mux step failed");
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -144,13 +156,24 @@ async fn main() -> Result<()> {
 
             match ensure_registered(&state, &snapshot, dir).await {
                 Ok((agent_id, agent_token, entry)) => {
+                    let session = entry
+                        .pi_session
+                        .clone()
+                        .unwrap_or_else(|| default_session_for(&entry.label, &entry.id));
+                    // Liveness is the OS process: a dead child shows honestly
+                    // here and is respawned on the next act job.
+                    let pi_dead = matches!(pi_sessions.probe(&session).await, Some(false));
                     set_dir_status(
                         &state,
                         &dir.id,
                         DirStatus {
-                            state: "online".into(),
+                            state: if pi_dead { "error".into() } else { "online".into() },
                             agent_id: Some(agent_id.clone()),
-                            last_error: None,
+                            last_error: if pi_dead {
+                                Some("pi process exited — restarts on next job".into())
+                            } else {
+                                None
+                            },
                             ..Default::default()
                         },
                     )
@@ -173,8 +196,8 @@ async fn main() -> Result<()> {
                         last_hb.insert(dir.id.clone(), Instant::now());
                     }
 
-                    let pi_svc = snapshot
-                        .pi_svc
+                    let pi_bin = snapshot
+                        .pi_bin
                         .as_ref()
                         .map(PathBuf::from)
                         .filter(|p| !p.as_os_str().is_empty());
@@ -187,7 +210,7 @@ async fn main() -> Result<()> {
                         agent_token: agent_token.clone(),
                         agent_id: agent_id.clone(),
                         work_dir: PathBuf::from(&entry.path),
-                        pi_svc,
+                        pi_bin,
                         pi_session: session,
                         provider: entry.provider.clone(),
                         model: entry.model.clone(),
@@ -208,7 +231,7 @@ async fn main() -> Result<()> {
                             )
                             .await;
                             let (ok, result, error) =
-                                runtime::execute_job(&api, &rt, &job, &stop).await;
+                                runtime::execute_job(&api, &pi_sessions, &rt, &job, &stop).await;
                             if let Err(e) = api
                                 .submit_result(&job.id.to_string(), ok, result, error.clone())
                                 .await
@@ -266,6 +289,8 @@ async fn main() -> Result<()> {
     }
 
     info!("worker stopped");
+    // Terminate owned pi children cleanly (polite shutdown → kill fallback).
+    pi_sessions.shutdown_all().await;
     Ok(())
 }
 
@@ -319,6 +344,7 @@ fn spawn_worker_heartbeat_task(state: Arc<AppState>) -> tokio::task::JoinHandle<
 async fn run_worker_mux_step(
     state: &Arc<AppState>,
     snapshot: &WorkerConfig,
+    sessions: &runtime::PiSessions,
     stop: &AtomicBool,
 ) -> Result<()> {
     let mut registered: Vec<(DirEntry, String, String)> = Vec::new();
@@ -338,13 +364,24 @@ async fn run_worker_mux_step(
         }
         match ensure_registered(state, snapshot, dir).await {
             Ok((agent_id, agent_token, entry)) => {
+                let session = entry
+                    .pi_session
+                    .clone()
+                    .unwrap_or_else(|| default_session_for(&entry.label, &entry.id));
+                // Liveness is the OS process: a dead child shows honestly
+                // here and is respawned on the next act job.
+                let pi_dead = matches!(sessions.probe(&session).await, Some(false));
                 set_dir_status(
                     state,
                     &dir.id,
                     DirStatus {
-                        state: "online".into(),
+                        state: if pi_dead { "error".into() } else { "online".into() },
                         agent_id: Some(agent_id.clone()),
-                        last_error: None,
+                        last_error: if pi_dead {
+                            Some("pi process exited — restarts on next job".into())
+                        } else {
+                            None
+                        },
                         ..Default::default()
                     },
                 )
@@ -400,8 +437,8 @@ async fn run_worker_mux_step(
             )
             .await;
             let api = ApiClient::new(&snapshot.host_ops_url, agent_token, &agent_id)?;
-            let pi_svc = snapshot
-                .pi_svc
+            let pi_bin = snapshot
+                .pi_bin
                 .as_ref()
                 .map(PathBuf::from)
                 .filter(|p| !p.as_os_str().is_empty());
@@ -414,13 +451,13 @@ async fn run_worker_mux_step(
                 agent_token: agent_token.clone(),
                 agent_id: agent_id.clone(),
                 work_dir: PathBuf::from(&entry.path),
-                pi_svc,
+                pi_bin,
                 pi_session: session,
                 provider: entry.provider.clone(),
                 model: entry.model.clone(),
                 event_interval_secs: 5.0,
             };
-            let (ok, result, error) = runtime::execute_job(&api, &rt, &job, stop).await;
+            let (ok, result, error) = runtime::execute_job(&api, sessions, &rt, &job, stop).await;
             if let Err(e) = api
                 .submit_result(&job.id.to_string(), ok, result, error.clone())
                 .await

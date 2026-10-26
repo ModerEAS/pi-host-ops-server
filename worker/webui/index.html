@@ -55,8 +55,8 @@
         <input id="dispatcherToken" type="password" autocomplete="off"/>
       </div>
       <div>
-        <label>Default PI_SVC path (optional)</label>
-        <input id="piSvc" placeholder="empty = shell-only until set"/>
+        <label>Pi binary path (optional, default <code>pi</code> from PATH)</label>
+        <input id="piBin" placeholder="empty = pi from PATH"/>
       </div>
     </div>
     <div class="row">
@@ -76,7 +76,7 @@
 
   <section class="card">
     <h2 style="margin:0 0 8px;font-size:15px">Directories (= agents)</h2>
-    <p class="muted">Each enabled directory is one agent / one pi_svc session. Change model per directory below.</p>
+    <p class="muted">Each enabled directory is one agent / one pi rpc session. Change model per directory below.</p>
     <table>
       <thead><tr><th>Label / path</th><th>Model</th><th>Status</th><th></th></tr></thead>
       <tbody id="dirRows"></tbody>
@@ -128,7 +128,7 @@ async function loadAll(){
     $('dispatcherToken').value = cfg.dispatcher_token||'';
     $('workerToken').value = cfg.worker_token||'';
     $('workerId').value = cfg.worker_id||'';
-    $('piSvc').value = cfg.pi_svc||'';
+    $('piBin').value = cfg.pi_bin||'';
     $('bindHint').textContent = 'UI ' + (cfg.webui_bind||'') + ' · ' + (cfg.config_path||'');
     const st = await api('/api/status');
     const rows = $('dirRows'); rows.innerHTML='';
@@ -170,7 +170,7 @@ async function saveSettings(){
       dispatcher_token: $('dispatcherToken').value,
       worker_token: $('workerToken').value,
       worker_id: $('workerId').value.trim() || null,
-      pi_svc: $('piSvc').value.trim() || null
+      pi_bin: $('piBin').value.trim() || null
     })});
     await loadAll();
   }catch(e){ err(String(e)); }

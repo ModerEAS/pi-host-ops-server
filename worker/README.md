@@ -2,9 +2,9 @@
 
 One local process with an embedded **WebUI** (`http://127.0.0.1:8788/`).
 
-- Add **directories** (each = one agent / one `pi_svc` session)
+- Add **directories** (each = one agent / one `pi --mode rpc` session)
 - Per directory: label, path, enabled, **provider + model** (default `opencode-go` / `muse-spark-1.3-contributor`; **Fast blocked**)
-- Settings: host-ops URL, dispatcher token (bootstrap), optional `PI_SVC` path
+- Settings: host-ops URL, dispatcher token (bootstrap), optional `pi` binary path (`pi_bin`, default `pi` from PATH)
 - Config only under user config dir — **never** inside project trees:
   - Linux/mac: `~/.config/pi-host-ops/config.json` (or `$XDG_CONFIG_HOME/pi-host-ops/`)
   - Windows: `%APPDATA%\pi-host-ops\config.json`
@@ -33,8 +33,8 @@ cargo run --release --bin worker
 
 1. WebUI edits save to user config dir
 2. For each enabled directory: register agent (dispatcher token) once, store token in config, heartbeat + poll
-3. Jobs run with that directory as cwd; `pi_svc start --provider --model` uses the directory's model
-4. Without `pi_svc`, only `shell` jobs succeed (typical early Windows setup)
+3. The worker spawns one `pi --mode rpc --provider --model --name <session> --approve` child per directory (cwd = that directory); no `pi_svc` involved
+4. Only `shell` jobs run without a Pi child; every other job needs the `pi` binary
 
 ## Multiplexed mode (many directories, one worker)
 
@@ -55,7 +55,7 @@ legacy per-directory mode (unchanged).
 
 ## Pi idle wait
 
-After `pi_svc send`, the worker waits for the session to go idle with two
+After the RPC prompt is accepted, the worker waits for the session to go idle with two
 budgets: an **absolute cap** (the job's `timeout_secs`, else **1h**) and an
 **inactivity budget** (**10 min** with no `running` state / output change).
 Long coding runs keep their lease renewed and stay alive while they work;

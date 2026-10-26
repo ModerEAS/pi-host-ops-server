@@ -3,7 +3,7 @@ name: CI
 # PR: run tests + build image (no push to GHCR).
 # master / v* tag: run tests, then build and push to ghcr.io/moderras/pi-host-ops-server.
 # NOTE: image name must stay lowercase (moderras, not ModerRAS).
-# Worker is NOT containerized (needs host pi_svc / project dirs); only the
+# Worker is NOT containerized (needs host pi binary / project dirs); only the
 # dispatcher server (Axum + SQLite) ships as an image.
 on:
   push:
