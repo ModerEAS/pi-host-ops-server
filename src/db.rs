@@ -930,10 +930,20 @@ impl Db {
 
     // ── Reapers ─────────────────────────────────────────────────────────
 
-    pub async fn mark_timed_out(&self, older_than: DateTime<Utc>) -> Result<u64> {
+    /// Mark timed-out running jobs; returns transitioned jobs for terminal webhooks.
+    pub async fn mark_timed_out(&self, older_than: DateTime<Utc>) -> Result<Vec<Job>> {
         let now = Utc::now().to_rfc3339();
         let cutoff = older_than.to_rfc3339();
-        let res = sqlx::query(
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM jobs WHERE status = 'running' AND claimed_at IS NOT NULL AND claimed_at < ?",
+        )
+        .bind(&cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        sqlx::query(
             r#"
             UPDATE jobs
             SET status = 'timed_out', finished_at = ?, updated_at = ?,
@@ -947,12 +957,32 @@ impl Db {
         .bind(&cutoff)
         .execute(&self.pool)
         .await?;
-        Ok(res.rows_affected())
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Ok(j) = Uuid::parse_str(&id) {
+                if let Ok(Some(job)) = self.get_job(j).await {
+                    if job.status == JobStatus::TimedOut {
+                        out.push(job);
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
-    pub async fn mark_lease_expired(&self) -> Result<u64> {
+    /// Mark lease-expired running jobs; returns transitioned jobs for webhooks.
+    pub async fn mark_lease_expired(&self) -> Result<Vec<Job>> {
         let now = Utc::now().to_rfc3339();
-        let res = sqlx::query(
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM jobs WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",
+        )
+        .bind(&now)
+        .fetch_all(&self.pool)
+        .await?;
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        sqlx::query(
             r#"
             UPDATE jobs
             SET status = 'timed_out', finished_at = ?, updated_at = ?,
@@ -966,11 +996,22 @@ impl Db {
         .bind(&now)
         .execute(&self.pool)
         .await?;
-        Ok(res.rows_affected())
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Ok(j) = Uuid::parse_str(&id) {
+                if let Ok(Some(job)) = self.get_job(j).await {
+                    if job.status == JobStatus::TimedOut {
+                        out.push(job);
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Queued jobs past their timeout with an offline/missing target agent → no_agent.
-    pub async fn mark_no_agent(&self, heartbeat_ttl_secs: i64) -> Result<u64> {
+    /// Returns transitioned jobs for webhooks.
+    pub async fn mark_no_agent(&self, heartbeat_ttl_secs: i64) -> Result<Vec<Job>> {
         let now = Utc::now();
         let now_s = now.to_rfc3339();
         // Jobs with explicit target_agent_id that is offline or missing, and created past timeout
@@ -984,7 +1025,7 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut n = 0u64;
+        let mut out = Vec::new();
         for row in rows {
             let id: String = row.try_get("id")?;
             let timeout_secs: Option<i64> = row.try_get("timeout_secs")?;
@@ -1022,9 +1063,15 @@ impl Db {
             .bind(&id)
             .execute(&self.pool)
             .await?;
-            n += res.rows_affected();
+            if res.rows_affected() > 0 {
+                if let Ok(j) = Uuid::parse_str(&id) {
+                    if let Ok(Some(job)) = self.get_job(j).await {
+                        out.push(job);
+                    }
+                }
+            }
         }
-        Ok(n)
+        Ok(out)
     }
 }
 
