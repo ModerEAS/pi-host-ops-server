@@ -176,6 +176,42 @@ Claim is atomic and **matched**: `target.agent_id`, or filter (`project` / `capa
 
 Statuses: `queued` | `running` | `succeeded` | `failed` | `timed_out` | `no_agent`
 
+## Terminal webhook (server → your bot)
+
+When a job enters a terminal status (`succeeded` / `failed` / `timed_out` /
+`no_agent`), the **server** POSTs once to `HOST_OPS_WEBHOOK_URL` — right after
+the status is persisted. Workers never send webhooks. Default off: no URL =
+no POST. Failures retry 3 attempts with backoff and only log; the stored job
+state is never affected.
+
+```bash
+HOST_OPS_WEBHOOK_URL=https://bot.example.com/host-ops/job-terminal
+HOST_OPS_WEBHOOK_AUTH="Bearer <grok-bot-secret>"   # or _FILE for Swarm secrets
+# HOST_OPS_WEBHOOK_HEADER=X-Webhook-Token          # custom header if your bot needs it
+```
+
+Body (JSON):
+
+```jsonc
+{
+  "job_id": "<uuid>",
+  "status": "succeeded",          // succeeded | failed | timed_out | no_agent
+  "agent_id": "duolinzao-scale",  // null if never claimed (e.g. no_agent)
+  "project": "duolinzao",         // claiming/target agent project, if known
+  "thread_id": "feature-x",       // + alias "thread" with the same value
+  "job_type": "shell",
+  "summary": "…truncated to 2000 chars…",  // + alias "text"; from result stdout/text/output, else error
+  "finished_at": "2026-10-30T…Z",
+  "error": "…"                   // only when present
+}
+```
+
+Grok Bot 例程对接：把你的接收路由（如 `POST /host-ops/job-terminal`）配成
+`HOST_OPS_WEBHOOK_URL`，校验 `Authorization` 头等于
+`HOST_OPS_WEBHOOK_AUTH` 的值（推荐 `Bearer <随机长串>`），按 `status` /
+`agent_id` / `project` / `thread` 分发即可；需要自定义头就把
+`HOST_OPS_WEBHOOK_HEADER` 配成同一个名字。
+
 ## Env
 
 | Variable | Default | Meaning |
@@ -187,6 +223,9 @@ Statuses: `queued` | `running` | `succeeded` | `failed` | `timed_out` | `no_agen
 | `HEARTBEAT_TTL_SECS` | `45` | Offline if `last_seen` older |
 | `LEASE_SECS` | `60` | Claim / renew lease |
 | `MAX_RESULT_BYTES` | `524288` | Result JSON cap |
+| `HOST_OPS_WEBHOOK_URL` | (empty = off) | Terminal-job webhook target; only when set does the server POST |
+| `HOST_OPS_WEBHOOK_AUTH` | (empty) | Secret sent as auth header value (e.g. `Bearer <token>`); or `HOST_OPS_WEBHOOK_AUTH_FILE` for Swarm secrets. Never logged |
+| `HOST_OPS_WEBHOOK_HEADER` | `Authorization` | Auth header name; set e.g. `X-Webhook-Token` for custom-header bots |
 
 ## Migrations
 

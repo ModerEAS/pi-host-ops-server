@@ -27,6 +27,9 @@ async fn test_state(dispatcher: &str, seed_agent: Option<&str>) -> AppState {
         data_dir: dir,
         heartbeat_ttl_secs: 45,
         lease_secs: 60,
+        webhook_url: None,
+        webhook_auth_header: "Authorization".to_string(),
+        webhook_auth: None,
     });
 
     let db = Db::connect(&database_url).await.unwrap();

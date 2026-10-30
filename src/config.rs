@@ -4,7 +4,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     pub bind: SocketAddr,
     pub database_url: String,
@@ -17,6 +17,38 @@ pub struct Config {
     pub heartbeat_ttl_secs: i64,
     /// Lease duration on claim / renew (default 60).
     pub lease_secs: i64,
+    /// Terminal-job webhook target. None/empty = disabled (default off).
+    pub webhook_url: Option<String>,
+    /// Header name for webhook auth (default `Authorization`).
+    pub webhook_auth_header: String,
+    /// Secret value sent as webhook auth header. Never log.
+    pub webhook_auth: Option<String>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("bind", &self.bind)
+            .field("database_url", &self.database_url)
+            .field("dispatcher_token", &"[redacted]")
+            .field("agent_token_seed", &self.agent_token_seed.as_ref().map(|_| "[redacted]"))
+            .field("max_result_bytes", &self.max_result_bytes)
+            .field("data_dir", &self.data_dir)
+            .field("heartbeat_ttl_secs", &self.heartbeat_ttl_secs)
+            .field("lease_secs", &self.lease_secs)
+            .field("webhook_url", &self.webhook_url)
+            .field("webhook_auth_header", &self.webhook_auth_header)
+            // Never print the secret itself.
+            .field("webhook_auth", &self.webhook_auth.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
+}
+
+impl Config {
+    /// Global switch: webhook fires only when a URL is configured.
+    pub fn webhook_enabled(&self) -> bool {
+        self.webhook_url.as_ref().map(|u| !u.trim().is_empty()).unwrap_or(false)
+    }
 }
 
 impl Config {
@@ -53,6 +85,20 @@ impl Config {
 
         let (dispatcher_token, agent_token_seed) = load_or_bootstrap_tokens(&data_dir)?;
 
+        let webhook_url = std::env::var("HOST_OPS_WEBHOOK_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let webhook_auth_header = std::env::var("HOST_OPS_WEBHOOK_HEADER")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Authorization".to_string());
+        // Secret via file wins (Swarm secret), plain env fallback. Never logged.
+        let webhook_auth = read_secret_or_env("HOST_OPS_WEBHOOK_AUTH_FILE", "HOST_OPS_WEBHOOK_AUTH")?
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         Ok(Self {
             bind,
             database_url,
@@ -62,6 +108,9 @@ impl Config {
             data_dir,
             heartbeat_ttl_secs,
             lease_secs,
+            webhook_url,
+            webhook_auth_header,
+            webhook_auth,
         })
     }
 }
