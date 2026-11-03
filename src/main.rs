@@ -18,15 +18,37 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(Config::from_env().context("load config")?);
     let state = bootstrap(config.clone()).await.context("bootstrap")?;
 
-    let db = state.db.clone();
+    let reaper_state = state.clone();
     let heartbeat_ttl = config.heartbeat_ttl_secs;
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             let cutoff = chrono::Utc::now() - chrono::Duration::minutes(10);
-            let _ = db.mark_timed_out(cutoff).await;
-            let _ = db.mark_lease_expired().await;
-            let _ = db.mark_no_agent(heartbeat_ttl).await;
+            // Each reaper returns transitioned terminal jobs; webhook once per job, server-side.
+            match reaper_state.db.mark_timed_out(cutoff).await {
+                Ok(jobs) => {
+                    for job in jobs {
+                        pi_host_ops_server::webhook::spawn_webhook(&reaper_state, job);
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "mark_timed_out failed"),
+            }
+            match reaper_state.db.mark_lease_expired().await {
+                Ok(jobs) => {
+                    for job in jobs {
+                        pi_host_ops_server::webhook::spawn_webhook(&reaper_state, job);
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "mark_lease_expired failed"),
+            }
+            match reaper_state.db.mark_no_agent(heartbeat_ttl).await {
+                Ok(jobs) => {
+                    for job in jobs {
+                        pi_host_ops_server::webhook::spawn_webhook(&reaper_state, job);
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "mark_no_agent failed"),
+            }
         }
     });
 

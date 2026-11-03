@@ -262,7 +262,11 @@ pub async fn submit_result(
         )
         .await
     {
-        Ok(SubmitOutcome::Ok(job)) => Json(job).into_response(),
+        Ok(SubmitOutcome::Ok(job)) => {
+            // Terminal (succeeded/failed): server-side webhook, async, never blocks persist.
+            crate::webhook::spawn_webhook(&state, job.clone());
+            Json(job).into_response()
+        }
         Ok(SubmitOutcome::NotFound) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "job not found" })),

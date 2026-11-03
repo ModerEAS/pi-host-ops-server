@@ -176,6 +176,70 @@ Claim is atomic and **matched**: `target.agent_id`, or filter (`project` / `capa
 
 Statuses: `queued` | `running` | `succeeded` | `failed` | `timed_out` | `no_agent`
 
+## Terminal webhook (server → your bot)
+
+When a job enters a terminal status (`succeeded` / `failed` / `timed_out` /
+`no_agent`), the **server** POSTs once to `HOST_OPS_WEBHOOK_URL` — right after
+the status is persisted. Workers never send webhooks. Default off: no URL =
+no POST. Failures retry 3 attempts with backoff and only log; the stored job
+state is never affected.
+
+```bash
+HOST_OPS_WEBHOOK_URL=https://bot.example.com/host-ops/job-terminal
+HOST_OPS_WEBHOOK_AUTH="Bearer <grok-bot-secret>"   # or _FILE for Swarm secrets
+# HOST_OPS_WEBHOOK_HEADER=X-Webhook-Token          # custom header if your bot needs it
+```
+
+Both URL and auth are treated as secrets. `*_FILE` variants win over plain env,
+so Swarm can mount them as files without the values showing up in
+`docker service inspect`:
+
+```bash
+HOST_OPS_WEBHOOK_URL_FILE=/run/secrets/host_ops_webhook_url
+HOST_OPS_WEBHOOK_AUTH_FILE=/run/secrets/host_ops_webhook_auth
+```
+
+On production (Swarm), CI injects these from the GitHub Environment
+`production` — nothing to edit in the stack file:
+
+- **Secrets**: `HOST_OPS_WEBHOOK_URL`, `HOST_OPS_WEBHOOK_AUTH`
+- **Variable** (optional, default `Authorization`): `HOST_OPS_WEBHOOK_HEADER`
+
+CI creates the Swarm secrets `host_ops_webhook_url` / `host_ops_webhook_auth`
+on first deploy; unset GitHub secrets leave the webhook off. Rotation and the
+empty-placeholder caveat: `docs/deploy.md` §1.4.
+
+URL and auth are never logged — `Config` debug prints `[configured]` only.
+Local dev keeps working with plain `.env` values (see `.env.example`).
+
+Body (JSON):
+
+```jsonc
+{
+  "job_id": "<uuid>",
+  "status": "succeeded",          // succeeded | failed | timed_out | no_agent
+  "agent_id": "duolinzao-scale",  // null if never claimed (e.g. no_agent)
+  "project": "duolinzao",         // claiming/target agent project, if known
+  "thread_id": "feature-x",       // + alias "thread" with the same value
+  "job_type": "shell",
+  "summary": "…truncated to 2000 chars…",  // + alias "text"; from result stdout/text/output, else error
+  "finished_at": "2026-10-30T…Z",
+  "error": "…"                   // only when present
+}
+```
+
+Grok Bot 例程对接（侧栏三项 ↔ 服务器 env）：
+
+| Grok Bot 例程侧栏 | 服务器 env | 说明 |
+|---|---|---|
+| 回调 / Webhook URL | `HOST_OPS_WEBHOOK_URL` | 例程的接收路由，如 `https://bot.example.com/host-ops/job-terminal` |
+| Header 名（默认 `Authorization`） | `HOST_OPS_WEBHOOK_HEADER` | 两边必须一致；默认 `Authorization` |
+| Secret / Token | `HOST_OPS_WEBHOOK_AUTH` | 该头的值，推荐 `Bearer <随机长串>`；与 URL 一样按 secret 存储 |
+
+接收端按 `status` / `agent_id` / `project` / `thread` 分发即可。生产环境把
+URL 与 AUTH 放进 GitHub Environment `production` 的 Secrets（不要用 Variables），
+HEADER 可放 Variables；本地 `.env` 仍可直接写明文。
+
 ## Env
 
 | Variable | Default | Meaning |
@@ -187,6 +251,9 @@ Statuses: `queued` | `running` | `succeeded` | `failed` | `timed_out` | `no_agen
 | `HEARTBEAT_TTL_SECS` | `45` | Offline if `last_seen` older |
 | `LEASE_SECS` | `60` | Claim / renew lease |
 | `MAX_RESULT_BYTES` | `524288` | Result JSON cap |
+| `HOST_OPS_WEBHOOK_URL` | (empty = off) | Terminal-job webhook target; secret. `HOST_OPS_WEBHOOK_URL_FILE` wins (Swarm secret file). Never logged |
+| `HOST_OPS_WEBHOOK_AUTH` | (empty) | Secret sent as auth header value (e.g. `Bearer <token>`); `HOST_OPS_WEBHOOK_AUTH_FILE` wins (Swarm secret file). Never logged |
+| `HOST_OPS_WEBHOOK_HEADER` | `Authorization` | Auth header name; set e.g. `X-Webhook-Token` for custom-header bots |
 
 ## Migrations
 
