@@ -26,6 +26,12 @@
 secrets:
   host_ops_dispatcher_token:
     external: true
+  # Optional webhook config, also external secrets. CI creates empty placeholders
+  # when the GitHub secrets are unset, so this stack always deploys (webhook off).
+  host_ops_webhook_url:
+    external: true
+  host_ops_webhook_auth:
+    external: true
 
 networks:
   traefik-public:
@@ -42,12 +48,20 @@ services:
       DATABASE_URL: sqlite:/data/host-ops.db
       # External secret injected as a file; server reads *_FILE first (see src/config.rs).
       DISPATCHER_TOKEN_FILE: /run/secrets/host_ops_dispatcher_token
+      # Webhook URL + auth are secrets (URL may carry a token); *_FILE wins over
+      # plain env, so empty placeholder files simply leave the webhook off.
+      HOST_OPS_WEBHOOK_URL_FILE: /run/secrets/host_ops_webhook_url
+      HOST_OPS_WEBHOOK_AUTH_FILE: /run/secrets/host_ops_webhook_auth
+      # Optional, not a secret: header name sent with the auth value.
+      HOST_OPS_WEBHOOK_HEADER: ${HOST_OPS_WEBHOOK_HEADER:-Authorization}
       HEARTBEAT_TTL_SECS: ${HEARTBEAT_TTL_SECS:-45}
       LEASE_SECS: ${LEASE_SECS:-60}
       MAX_RESULT_BYTES: ${MAX_RESULT_BYTES:-524288}
       RUST_LOG: ${RUST_LOG:-pi_host_ops_server=info,tower_http=info}
     secrets:
       - host_ops_dispatcher_token
+      - host_ops_webhook_url
+      - host_ops_webhook_auth
     volumes:
       - ${DEPLOY_PATH}:/data
     deploy:

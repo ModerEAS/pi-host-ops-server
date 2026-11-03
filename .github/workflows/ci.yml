@@ -185,15 +185,53 @@ jobs:
           SSH "mkdir -p '${DEPLOY_PATH}'"
           scp -i ~/.ssh/id_deploy -P "${DEPLOY_PORT:-22}" -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts -o BatchMode=yes \
             deploy/stack.yml "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/"
+      - name: create missing Swarm secrets (dispatcher + optional webhook)
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DISPATCHER_TOKEN: ${{ secrets.DISPATCHER_TOKEN }}
+          HOST_OPS_WEBHOOK_URL: ${{ secrets.HOST_OPS_WEBHOOK_URL }}
+          HOST_OPS_WEBHOOK_AUTH: ${{ secrets.HOST_OPS_WEBHOOK_AUTH }}
+        run: |
+          set -euo pipefail
+          SSH() { ssh -i ~/.ssh/id_deploy -p "${DEPLOY_PORT:-22}" -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts -o BatchMode=yes "${DEPLOY_USER}@${DEPLOY_HOST}" "$@"; }
+          # Created once, never recreated (docker secrets are immutable). Values
+          # travel via stdin only, never in the remote command line.
+          if [ -z "${DISPATCHER_TOKEN:-}" ]; then
+            echo "DISPATCHER_TOKEN secret is empty — set the production environment secret DISPATCHER_TOKEN (dispatcher Bearer)" >&2
+            exit 1
+          fi
+          # $1=secret name, $2=value. Empty value -> 1-byte placeholder file that
+          # the server trims to "not configured" (webhook off), so the stack
+          # always deploys even before the webhook is set up.
+          ensure_secret() {
+            local name="$1" value="$2"
+            if SSH "docker secret inspect ${name} >/dev/null 2>&1"; then
+              echo "${name}: exists, leaving it (immutable)"
+            elif [ -n "$value" ]; then
+              printf '%s' "$value" | SSH "docker secret create ${name} - >/dev/null"
+              echo "${name}: created"
+            else
+              printf '\n' | SSH "docker secret create ${name} - >/dev/null"
+              echo "${name}: placeholder (empty) — webhook stays off"
+            fi
+          }
+          ensure_secret host_ops_dispatcher_token "$DISPATCHER_TOKEN"
+          if [ -z "${HOST_OPS_WEBHOOK_URL:-}" ] || [ -z "${HOST_OPS_WEBHOOK_AUTH:-}" ]; then
+            echo "::warning::HOST_OPS_WEBHOOK_URL / HOST_OPS_WEBHOOK_AUTH not set in the production environment — webhook stays off. To enable later: set both secrets, then on the manager run 'docker stack rm host-ops' and 'docker secret rm host_ops_webhook_url host_ops_webhook_auth', and re-run deploy."
+          fi
+          ensure_secret host_ops_webhook_url "${HOST_OPS_WEBHOOK_URL:-}"
+          ensure_secret host_ops_webhook_auth "${HOST_OPS_WEBHOOK_AUTH:-}"
       - name: pull image and deploy (start-first, rollback on failure)
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
-          DISPATCHER_TOKEN: ${{ secrets.DISPATCHER_TOKEN }}
           GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
           GHCR_USER: ${{ github.repository_owner }}
+          HOST_OPS_WEBHOOK_HEADER: ${{ vars.HOST_OPS_WEBHOOK_HEADER }}
           TRAEFIK_ENTRYPOINT: ${{ vars.TRAEFIK_ENTRYPOINT }}
           TRAEFIK_CERTRESOLVER: ${{ vars.TRAEFIK_CERTRESOLVER }}
           TRAEFIK_NETWORK: ${{ vars.TRAEFIK_NETWORK }}
@@ -204,20 +242,8 @@ jobs:
           if [ -n "${GHCR_PULL_TOKEN:-}" ]; then
             printf '%s' "$GHCR_PULL_TOKEN" | SSH "docker login ghcr.io -u '${GHCR_USER}' --password-stdin"
           fi
-          # Dispatcher token -> Swarm secret (created once, never recreated:
-          # docker secrets are immutable). Token travels via stdin only,
-          # never in the remote command line (same pattern as GHCR login).
-          if [ -z "${DISPATCHER_TOKEN:-}" ]; then
-            echo "DISPATCHER_TOKEN secret is empty — set the production environment secret DISPATCHER_TOKEN (dispatcher Bearer)" >&2
-            exit 1
-          fi
-          if SSH "docker secret inspect host_ops_dispatcher_token >/dev/null 2>&1"; then
-            echo "host_ops_dispatcher_token: exists, leaving it"
-          else
-            printf '%s' "$DISPATCHER_TOKEN" | SSH "docker secret create host_ops_dispatcher_token - >/dev/null"
-            echo "host_ops_dispatcher_token: created"
-          fi
-          SSH "cd '${DEPLOY_PATH}' && DEPLOY_PATH='${DEPLOY_PATH}' IMAGE_TAG='${IMAGE_TAG}' HOST_OPS_DOMAIN='${HOST_OPS_DOMAIN:-}' TRAEFIK_ENTRYPOINT='${TRAEFIK_ENTRYPOINT:-}' TRAEFIK_CERTRESOLVER='${TRAEFIK_CERTRESOLVER:-}' TRAEFIK_NETWORK='${TRAEFIK_NETWORK:-}' docker stack deploy -c stack.yml --with-registry-auth host-ops"
+          # Dispatcher + webhook secrets were ensured by the previous step.
+          SSH "cd '${DEPLOY_PATH}' && DEPLOY_PATH='${DEPLOY_PATH}' IMAGE_TAG='${IMAGE_TAG}' HOST_OPS_DOMAIN='${HOST_OPS_DOMAIN:-}' HOST_OPS_WEBHOOK_HEADER='${HOST_OPS_WEBHOOK_HEADER:-}' TRAEFIK_ENTRYPOINT='${TRAEFIK_ENTRYPOINT:-}' TRAEFIK_CERTRESOLVER='${TRAEFIK_CERTRESOLVER:-}' TRAEFIK_NETWORK='${TRAEFIK_NETWORK:-}' docker stack deploy -c stack.yml --with-registry-auth host-ops"
       - name: wait for host-ops_server to converge (timeout fails)
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}

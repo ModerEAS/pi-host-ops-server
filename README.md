@@ -190,6 +190,28 @@ HOST_OPS_WEBHOOK_AUTH="Bearer <grok-bot-secret>"   # or _FILE for Swarm secrets
 # HOST_OPS_WEBHOOK_HEADER=X-Webhook-Token          # custom header if your bot needs it
 ```
 
+Both URL and auth are treated as secrets. `*_FILE` variants win over plain env,
+so Swarm can mount them as files without the values showing up in
+`docker service inspect`:
+
+```bash
+HOST_OPS_WEBHOOK_URL_FILE=/run/secrets/host_ops_webhook_url
+HOST_OPS_WEBHOOK_AUTH_FILE=/run/secrets/host_ops_webhook_auth
+```
+
+On production (Swarm), CI injects these from the GitHub Environment
+`production` — nothing to edit in the stack file:
+
+- **Secrets**: `HOST_OPS_WEBHOOK_URL`, `HOST_OPS_WEBHOOK_AUTH`
+- **Variable** (optional, default `Authorization`): `HOST_OPS_WEBHOOK_HEADER`
+
+CI creates the Swarm secrets `host_ops_webhook_url` / `host_ops_webhook_auth`
+on first deploy; unset GitHub secrets leave the webhook off. Rotation and the
+empty-placeholder caveat: `docs/deploy.md` §1.4.
+
+URL and auth are never logged — `Config` debug prints `[configured]` only.
+Local dev keeps working with plain `.env` values (see `.env.example`).
+
 Body (JSON):
 
 ```jsonc
@@ -206,11 +228,17 @@ Body (JSON):
 }
 ```
 
-Grok Bot 例程对接：把你的接收路由（如 `POST /host-ops/job-terminal`）配成
-`HOST_OPS_WEBHOOK_URL`，校验 `Authorization` 头等于
-`HOST_OPS_WEBHOOK_AUTH` 的值（推荐 `Bearer <随机长串>`），按 `status` /
-`agent_id` / `project` / `thread` 分发即可；需要自定义头就把
-`HOST_OPS_WEBHOOK_HEADER` 配成同一个名字。
+Grok Bot 例程对接（侧栏三项 ↔ 服务器 env）：
+
+| Grok Bot 例程侧栏 | 服务器 env | 说明 |
+|---|---|---|
+| 回调 / Webhook URL | `HOST_OPS_WEBHOOK_URL` | 例程的接收路由，如 `https://bot.example.com/host-ops/job-terminal` |
+| Header 名（默认 `Authorization`） | `HOST_OPS_WEBHOOK_HEADER` | 两边必须一致；默认 `Authorization` |
+| Secret / Token | `HOST_OPS_WEBHOOK_AUTH` | 该头的值，推荐 `Bearer <随机长串>`；与 URL 一样按 secret 存储 |
+
+接收端按 `status` / `agent_id` / `project` / `thread` 分发即可。生产环境把
+URL 与 AUTH 放进 GitHub Environment `production` 的 Secrets（不要用 Variables），
+HEADER 可放 Variables；本地 `.env` 仍可直接写明文。
 
 ## Env
 
@@ -223,8 +251,8 @@ Grok Bot 例程对接：把你的接收路由（如 `POST /host-ops/job-terminal
 | `HEARTBEAT_TTL_SECS` | `45` | Offline if `last_seen` older |
 | `LEASE_SECS` | `60` | Claim / renew lease |
 | `MAX_RESULT_BYTES` | `524288` | Result JSON cap |
-| `HOST_OPS_WEBHOOK_URL` | (empty = off) | Terminal-job webhook target; only when set does the server POST |
-| `HOST_OPS_WEBHOOK_AUTH` | (empty) | Secret sent as auth header value (e.g. `Bearer <token>`); or `HOST_OPS_WEBHOOK_AUTH_FILE` for Swarm secrets. Never logged |
+| `HOST_OPS_WEBHOOK_URL` | (empty = off) | Terminal-job webhook target; secret. `HOST_OPS_WEBHOOK_URL_FILE` wins (Swarm secret file). Never logged |
+| `HOST_OPS_WEBHOOK_AUTH` | (empty) | Secret sent as auth header value (e.g. `Bearer <token>`); `HOST_OPS_WEBHOOK_AUTH_FILE` wins (Swarm secret file). Never logged |
 | `HOST_OPS_WEBHOOK_HEADER` | `Authorization` | Auth header name; set e.g. `X-Webhook-Token` for custom-header bots |
 
 ## Migrations

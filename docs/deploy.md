@@ -24,6 +24,10 @@ appear here.
 - `DISPATCHER_TOKEN` (and optional `AGENT_TOKEN` seed) can come from
   `DISPATCHER_TOKEN_FILE` / `AGENT_TOKEN_FILE` (e.g. `/run/secrets/...`);
   file contents (trimmed) win over the plain env var (see `src/config.rs`).
+- Webhook config follows the same rule: `HOST_OPS_WEBHOOK_URL_FILE` /
+  `HOST_OPS_WEBHOOK_AUTH_FILE` win over `HOST_OPS_WEBHOOK_URL` /
+  `HOST_OPS_WEBHOOK_AUTH`. URL and auth are both secrets and are never logged;
+  `HOST_OPS_WEBHOOK_HEADER` (default `Authorization`) is a plain value.
 
 ## 1. First-time setup (on manager, once)
 
@@ -54,7 +58,7 @@ crash-consistent copies of `host-ops.db`).
 - External net (default `traefik-public`, rename via `TRAEFIK_NETWORK`):
   already exists, Traefik uses it; the stack only references it.
 
-### 1.4 Docker secret (1, external — created by CI on first deploy if absent)
+### 1.4 Docker secrets (external — created by CI on first deploy if absent)
 
 Normally you do nothing: the deploy job creates `host_ops_dispatcher_token`
 from the GitHub `production` environment secret `DISPATCHER_TOKEN` when it is
@@ -67,8 +71,31 @@ docker secret ls
 ```
 
 The stack injects it as `DISPATCHER_TOKEN_FILE=/run/secrets/host_ops_dispatcher_token`.
-Rotating: `docker secret create` a new name is NOT supported by the stack file —
-remove the stack, `docker secret rm`, re-create, re-deploy.
+
+Webhook (optional, default off): the same deploy job ensures
+`host_ops_webhook_url` and `host_ops_webhook_auth` from the production secrets
+`HOST_OPS_WEBHOOK_URL` / `HOST_OPS_WEBHOOK_AUTH`, mounted as
+`HOST_OPS_WEBHOOK_URL_FILE` / `HOST_OPS_WEBHOOK_AUTH_FILE`. A missing GitHub
+secret does **not** fail the deploy: CI creates a 1-byte placeholder secret,
+the server trims it to empty and the webhook stays off. To enable it later
+(after adding the GitHub secrets), the placeholder must be replaced by hand on
+the manager once, because Docker secrets are immutable:
+
+```bash
+docker stack rm host-ops
+docker secret rm host_ops_webhook_url host_ops_webhook_auth
+docker secret ls   # then re-run the deploy workflow
+```
+
+Manual equivalent (before the first deploy):
+
+```bash
+printf '%s' 'https://bot.example.com/host-ops/job-terminal' | docker secret create host_ops_webhook_url -
+printf '%s' 'Bearer <token>' | docker secret create host_ops_webhook_auth -
+```
+
+Rotating any secret: `docker secret create` a new name is NOT supported by the
+stack file — remove the stack, `docker secret rm`, re-create, re-deploy.
 
 ### 1.5 No public network?
 
@@ -95,6 +122,7 @@ stack, and add `ports: ["8787:8787"]` to the service. Everything else
 | `TRAEFIK_ENTRYPOINT` | `web` | Traefik entrypoint name |
 | `TRAEFIK_CERTRESOLVER` | `letsencrypt` | Cert resolver name |
 | `TRAEFIK_NETWORK` | `traefik-public` | External network real name (stack reference + `traefik.docker.network` use the same value) |
+| `HOST_OPS_WEBHOOK_HEADER` | `Authorization` | Optional; auth header name sent to the webhook (not a secret) |
 
 ### 2.2 Secrets (same place, Secrets tab)
 
@@ -107,6 +135,8 @@ stack, and add `ports: ["8787:8787"]` to the service. Everything else
 | `DEPLOY_KNOWN_HOSTS` | `ssh-keyscan -p PORT HOST` output; SSH verifies strictly |
 | `DEPLOY_PATH` | Dir on manager holding the stack, e.g. `/opt/host-ops` |
 | `DISPATCHER_TOKEN` | Dispatcher Bearer; CI creates Swarm secret `host_ops_dispatcher_token` on first deploy if absent (never recreated) |
+| `HOST_OPS_WEBHOOK_URL` | Terminal webhook target URL (**secret**, may embed a token); CI creates Swarm secret `host_ops_webhook_url` if absent. Unset = webhook off |
+| `HOST_OPS_WEBHOOK_AUTH` | Webhook auth header value (e.g. `Bearer <token>`); CI creates Swarm secret `host_ops_webhook_auth` if absent. Unset = webhook off |
 | `GHCR_PULL_TOKEN` | Optional; see 1.6 |
 
 ### 2.3 Environments
@@ -129,8 +159,10 @@ Deploy condition: main repo (`ModerRAS/pi-host-ops-server`) + `refs/heads/master
    the upcoming release tag `v<next>`), **in parallel with** `binaries`
    (all release binaries compiled + uploaded as workflow artifacts).
 2. `deploy` (needs both, so production approval only blocks here; a failed
-   build never reaches deploy): scp `stack.yml` to `DEPLOY_PATH`; inject
-   `IMAGE_TAG`/`HOST_OPS_DOMAIN`/Traefik vars; then
+   build never reaches deploy): scp `stack.yml` to `DEPLOY_PATH`; ensure the
+   Swarm secrets exist (dispatcher from `DISPATCHER_TOKEN`; webhook URL/auth
+   from their production secrets, empty placeholders when unset); inject
+   `IMAGE_TAG`/`HOST_OPS_DOMAIN`/`HOST_OPS_WEBHOOK_HEADER`/Traefik vars; then
    `docker stack deploy -c stack.yml --with-registry-auth host-ops`.
 3. Poll `host-ops_server`: spec or running tasks carry the new tag prefix
    (Swarm resolves to `tag@sha256:...`, so prefix-match), a Running task
