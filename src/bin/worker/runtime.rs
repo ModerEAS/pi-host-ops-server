@@ -22,10 +22,12 @@ use crate::config::{reject_fast, DEFAULT_MODEL, DEFAULT_PROVIDER};
 
 const MAX_RESULT_BYTES: usize = 512 * 1024;
 const DEFAULT_SHELL_TIMEOUT: u64 = 60;
-/// Give up only after this long with no observable Pi activity (10 min).
-/// There is no wall-clock cap: a long coding/`act` run never fails for being
-/// slow, only for being genuinely stuck (see `decide_wait`).
+/// Silence tolerated with no observable Pi progress (10 min) — the primary
+/// timeout for a Pi job: a healthy busy run never dies from the wall clock.
 const DEFAULT_PI_INACTIVITY_SECS: f64 = 600.0;
+/// Slack added when a declared command timeout raises the Pi wait budget, so
+/// the wait outlives the command it is waiting on instead of racing it.
+const PI_WAIT_SLACK_SECS: u64 = 60;
 const POLL_STATUS_INTERVAL: f64 = 2.0;
 
 const PI_JOB_TYPES: &[&str] = &["observe", "act", "open", "clipboard", "notify"];
@@ -1082,8 +1084,8 @@ enum WaitEnd {
 fn decide_wait(
     terminal: bool,
     idle_done: bool,
-    idle_elapsed_secs: f64,
-    inactivity_secs: f64,
+    quiet_secs: f64,
+    budget_secs: f64,
 ) -> WaitEnd {
     if terminal {
         return WaitEnd::Terminal;
@@ -1091,10 +1093,31 @@ fn decide_wait(
     if idle_done {
         return WaitEnd::IdleDone;
     }
-    if idle_elapsed_secs >= inactivity_secs {
+    if quiet_secs >= budget_secs {
         return WaitEnd::TimeoutInactivity;
     }
     WaitEnd::Continue
+}
+
+/// Command timeout the job asked for, if any (`timeout_secs` on the job or in
+/// the payload, e.g. a 2h shell). `0` / negative means "unset".
+fn declared_timeout_secs(job: &Job) -> Option<u64> {
+    job.timeout_secs
+        .or_else(|| job.payload.get("timeout_secs").and_then(|v| v.as_i64()))
+        .filter(|&t| t > 0)
+        .map(|t| t as u64)
+}
+
+/// Longest silence tolerated before the Pi wait ends.
+///
+/// Inactivity first: **600s** with no observable progress. That budget is also
+/// the job's absolute wait budget — it adapts upward, never down, when the job
+/// or its payload declares a longer command timeout (a 2h shell → ~2h wait),
+/// so the old flat 1h cap can never truncate work that explicitly asked for
+/// longer. Progress refreshes it, so a busy agent is never cut off.
+fn wait_budget_secs(declared_command_timeout_secs: Option<u64>) -> f64 {
+    let declared = declared_command_timeout_secs.unwrap_or(0) as f64;
+    DEFAULT_PI_INACTIVITY_SECS.max(declared + PI_WAIT_SLACK_SECS as f64)
 }
 
 struct WaitOutcome {
@@ -1104,15 +1127,15 @@ struct WaitOutcome {
 }
 
 /// Activity-based wait for the Pi session to go idle after the prompt is
-/// accepted. One budget: inactivity, refreshed by observable progress.
-/// Progress comes from the owned
-/// child's in-memory state, and a dead child ends the wait as a failure —
-/// never as idle success. Lease renewals + progress events continue as today.
+/// accepted. One sliding budget (`budget_secs`): refreshed by observable
+/// progress, ended only by silence. Progress comes from the owned child's
+/// in-memory state, and a dead child ends the wait as a failure — never as
+/// idle success. Lease renewals + progress events continue as today.
 async fn wait_until_idle_with_events(
     api: &ApiClient,
     sess: &PiSession,
     job_id: &str,
-    inactivity_secs: f64,
+    budget_secs: f64,
     event_interval_secs: f64,
     settled_before: Option<i64>,
     stop: &AtomicBool,
@@ -1178,7 +1201,7 @@ async fn wait_until_idle_with_events(
             terminal,
             idle_done,
             last_progress_at.elapsed().as_secs_f64(),
-            inactivity_secs,
+            budget_secs,
         );
         match end {
             WaitEnd::Continue => {}
@@ -1208,8 +1231,16 @@ async fn run_via_pi(
     };
     let settled_before = Some(sess.snapshot().await.settled_count);
     let prompt = build_pi_prompt(job);
-    // `timeout_secs` is NOT a Pi run cap; only silence ends this wait.
-    let inactivity_secs = DEFAULT_PI_INACTIVITY_SECS;
+    // Inactivity-first: silence ends this wait. A declared command timeout
+    // (job or payload) only raises the budget, never lowers it.
+    let declared = declared_timeout_secs(job);
+    let budget_secs = wait_budget_secs(declared);
+    let budget_why = match declared {
+        Some(t) if budget_secs > DEFAULT_PI_INACTIVITY_SECS => {
+            format!("; budget raised for a {t}s command timeout")
+        }
+        _ => String::new(),
+    };
 
     let delivery = job.delivery_mode.as_deref().unwrap_or("steer").trim().to_lowercase();
     let job_id = job.id.to_string();
@@ -1233,7 +1264,7 @@ async fn run_via_pi(
         return (false, None, Some(format!("pi rejected prompt: {}", accept.error.unwrap_or_else(|| "unknown".into()))));
     }
     info!(session = %rt.pi_session, disposition = ?accept.disposition, "pi rpc prompt accepted");
-    let outcome = wait_until_idle_with_events(api, &sess, &job_id, inactivity_secs, rt.event_interval_secs, settled_before, stop).await;
+    let outcome = wait_until_idle_with_events(api, &sess, &job_id, budget_secs, rt.event_interval_secs, settled_before, stop).await;
     let st = outcome.status;
     let text_tail = st.text_tail();
     let wait_timeout = outcome.end == WaitEnd::TimeoutInactivity;
@@ -1251,6 +1282,7 @@ async fn run_via_pi(
         "text_log_tail": tail_chars(st.text_log(), 8000),
         "wait_timeout": wait_timeout,
         "timeout_kind": timeout_kind,
+        "wait_budget_secs": budget_secs,
     }));
     let mut ok = true;
     let mut err_msg = None;
@@ -1268,14 +1300,14 @@ async fn run_via_pi(
         ok = false;
         err_msg = Some(if !outcome.saw_running && st.state != "idle" {
             format!(
-                "Pi inactivity timeout after {}s: send accepted but agent never started (state={})",
-                inactivity_secs as u64,
+                "Pi inactivity timeout after {}s: send accepted but agent never started (state={}){budget_why}",
+                budget_secs as u64,
                 st.state,
             )
         } else {
             format!(
-                "Pi inactivity timeout after {}s with no progress (state={})",
-                inactivity_secs as u64, st.state,
+                "Pi inactivity timeout after {}s with no progress (state={}){budget_why}",
+                budget_secs as u64, st.state,
             )
         });
     }
@@ -1287,9 +1319,7 @@ async fn run_shell_local(rt: &DirRuntime, job: &Job) -> (bool, Option<Value>, Op
     let Some(command) = command.filter(|c| !c.trim().is_empty()) else {
         return (false, None, Some("shell job missing payload.command string".into()));
     };
-    let timeout_secs = job.timeout_secs
-        .or_else(|| job.payload.get("timeout_secs").and_then(|v| v.as_i64()))
-        .filter(|&t| t > 0)
+    let timeout_secs = declared_timeout_secs(job)
         .map(|t| t as f64)
         .unwrap_or(DEFAULT_SHELL_TIMEOUT as f64);
     let cwd = job.payload.get("cwd").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(PathBuf::from)
@@ -1396,25 +1426,60 @@ mod tests {
 
     #[test]
     fn wait_policy_branches() {
-        let inact = 600.0;
-        // Long run, still working → keep waiting. There is no wall clock, so
-        // even an hour-long busy run continues.
-        assert_eq!(decide_wait(false, false, 5.0, inact), WaitEnd::Continue);
-        // Silence past the inactivity budget → inactivity timeout.
-        assert_eq!(decide_wait(false, false, 600.0, inact), WaitEnd::TimeoutInactivity);
+        let budget = wait_budget_secs(None);
+        assert_eq!(budget, 600.0, "inactivity-first default");
+        // Still working just under the budget → keep waiting.
+        assert_eq!(decide_wait(false, false, 599.0, budget), WaitEnd::Continue);
+        // Silence at the budget → timeout.
+        assert_eq!(decide_wait(false, false, 600.0, budget), WaitEnd::TimeoutInactivity);
         // Idle after running → success, even right at the deadline.
-        assert_eq!(decide_wait(false, true, 600.0, inact), WaitEnd::IdleDone);
+        assert_eq!(decide_wait(false, true, 600.0, budget), WaitEnd::IdleDone);
         // Terminal state beats the timeout.
-        assert_eq!(decide_wait(true, false, 600.0, inact), WaitEnd::Terminal);
+        assert_eq!(decide_wait(true, false, 600.0, budget), WaitEnd::Terminal);
     }
 
-    /// The old 3600s absolute cap must never end an active wait: the policy has
-    /// no elapsed-time input at all, only time since the last progress.
+    /// A declared inner command timeout raises the wait budget, so a 2h shell is
+    /// never killed at the old flat 1h (3600s). Shorter declarations never lower
+    /// the inactivity default.
     #[test]
-    fn wait_policy_has_no_absolute_cap() {
-        for idle_e in [0.0, 1.0, 599.0] {
-            assert_eq!(decide_wait(false, false, idle_e, 600.0), WaitEnd::Continue);
+    fn wait_budget_adapts_up_to_long_command_timeout() {
+        assert_eq!(wait_budget_secs(None), 600.0);
+        assert_eq!(wait_budget_secs(Some(0)), 600.0);
+        assert_eq!(wait_budget_secs(Some(60)), 600.0);
+        let two_hours = wait_budget_secs(Some(7200));
+        assert!(two_hours >= 7200.0, "budget {two_hours} must cover a 2h command");
+        assert_eq!(two_hours, 7260.0);
+        assert_eq!(wait_budget_secs(Some(3 * 3600)), 3.0 * 3600.0 + 60.0);
+    }
+
+    fn job_with(payload: Value, timeout_secs: Option<i64>) -> Job {
+        Job {
+            id: Uuid::new_v4(),
+            job_type: "shell".into(),
+            payload,
+            timeout_secs,
+            delivery_mode: None,
         }
+    }
+
+    /// `timeout_secs` comes from the job, else the payload (shell commands).
+    #[test]
+    fn declared_timeout_comes_from_job_or_payload() {
+        assert_eq!(declared_timeout_secs(&job_with(json!({}), None)), None);
+        assert_eq!(
+            declared_timeout_secs(&job_with(json!({"timeout_secs": 7200}), None)),
+            Some(7200)
+        );
+        // Job field wins over the payload, and 0 / negative mean "unset".
+        assert_eq!(
+            declared_timeout_secs(&job_with(json!({"timeout_secs": 7200}), Some(90))),
+            Some(90)
+        );
+        assert_eq!(declared_timeout_secs(&job_with(json!({}), Some(0))), None);
+        assert_eq!(declared_timeout_secs(&job_with(json!({"timeout_secs": -5}), Some(0))), None);
+        // A 2h shell command lifts the Pi wait budget past 1h.
+        let job = job_with(json!({"command": "make", "timeout_secs": 7200}), None);
+        assert!(wait_budget_secs(declared_timeout_secs(&job)) >= 7200.0);
     }
 
     /// Fold a status timeline through the same progress/idle accounting the
@@ -1422,7 +1487,8 @@ mod tests {
     /// coding run with occasional output must not time out at old 300s.
     #[test]
     fn wait_policy_survives_slow_coding_run() {
-        let inact = 600.0;
+        // A slow coding run with a 2h-capable command timeout.
+        let inact = wait_budget_secs(Some(7200));
         // (state, tail, tool, settled, dt_secs)
         let timeline: Vec<(&str, &str, Option<&str>, i64, f64)> = vec![
             ("idle", "", None, 0, 2.0), // send just dispatched
@@ -1454,6 +1520,43 @@ mod tests {
                 break;
             }
         }
+        assert_eq!(end, WaitEnd::IdleDone);
+    }
+
+    /// The headline requirement: busy past 1h with fresh progress is not killed.
+    #[test]
+    fn wait_policy_busy_run_past_one_hour_never_times_out() {
+        let inact = wait_budget_secs(Some(7200));
+        let mut prev = PiProgress::default();
+        let mut saw_running = false;
+        let mut quiet = 0.0;
+        let mut elapsed = 0.0;
+        let mut end = WaitEnd::Continue;
+        // 4 hours of work: a tool call every 5 min, never 600s of silence.
+        for step in 0..48 {
+            let (state, tail, tool, settled, dt) = if step == 47 {
+                ("idle", "done", Some("wiki_observe"), 1, 5.0)
+            } else {
+                ("running", "step", Some("bash"), 0, 305.0)
+            };
+            let cur = progress(state, &format!("{tail}{step}"), tool, settled);
+            if cur.running {
+                saw_running = true;
+            }
+            if cur.advanced_since(&prev) {
+                quiet = 0.0;
+            } else {
+                quiet += dt;
+            }
+            prev = cur;
+            elapsed += dt;
+            let idle_done = state == "idle" && saw_running;
+            end = decide_wait(false, idle_done, quiet, inact);
+            if end != WaitEnd::Continue {
+                break;
+            }
+        }
+        assert!(elapsed > 3600.0, "timeline must pass the old 1h cap (was {elapsed}s)");
         assert_eq!(end, WaitEnd::IdleDone);
     }
 

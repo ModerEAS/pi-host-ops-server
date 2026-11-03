@@ -97,23 +97,30 @@ curl -sS http://127.0.0.1:8787/v1/agents \
 | **`steer`** (default) | prompt with `streamingBehavior: steer` — interrupt/redirect current turn |
 | **`queue`** | idle → plain prompt; busy → prompt with `streamingBehavior: followUp` |
 
-### Pi idle wait (activity-based, no wall clock)
+### Pi idle wait (inactivity first, adaptive absolute budget)
 
 After the RPC prompt is accepted, the worker waits for the Pi session to go
-idle with **one budget** (see `src/bin/worker/runtime.rs`):
+idle. **Silence is what ends a wait**, not elapsed time (see
+`src/bin/worker/runtime.rs`):
 
-- **Inactivity budget** — **600s (10 min)** with no observable progress
+- **Inactivity budget — 600s (10 min)** with no observable progress
   (`running` state, or `text_tail` / `last_tool` / `settled_count` changing).
-  While the agent works, the deadline keeps refreshing, so a 6-hour coding
-  run is fine.
+  Every progress tick refreshes the deadline, so a 6-hour coding run is fine.
+- **The absolute wait budget is that same silence budget**, raised — never
+  lowered — when the job or its payload declares a longer command timeout:
+  `max(600s, timeout_secs + 60s slack)`. A shell/act job that asks for a 2h
+  command gets ~2h of patience instead of being killed at 1h. A bare shell
+  with no timeout keeps its own **60s** command timeout
+  (`DEFAULT_SHELL_TIMEOUT`), which is a different thing from the Pi wait.
 
-There is **no absolute wall-clock cap** on a Pi job. `timeout_secs` stays in
-the API for shell jobs (their own command timeout, default **60s**) and for
-`no_agent` routing of queued jobs; `host-ops job create --timeout` no longer
-shortens a Pi wait. An agent that hangs with zero progress still fails after
-10 min of silence, with `timeout_kind: "inactivity"`, `wait_timeout: true`,
-and a plain message (`Pi inactivity timeout after 600s with no progress ...`).
-A send that never starts the agent fails with its own distinct message.
+There is no flat wall-clock cap (no more "1h and you are done"). A hang with
+zero progress fails after the budget with `timeout_kind: "inactivity"`,
+`wait_timeout: true`, the value used in `wait_budget_secs`, and a plain
+message (`Pi inactivity timeout after 7260s with no progress ...`). A send
+that never starts the agent fails with its own distinct message.
+
+`host-ops job create|steer --timeout N` sets the job's command timeout; it
+raises the Pi wait budget to at least `N + 60s`, it never shortens a wait.
 
 ### Pi child liveness (no pi_svc)
 
@@ -178,8 +185,12 @@ Statuses: `queued` | `running` | `succeeded` | `failed` | `timed_out` | `no_agen
 Nothing on the server caps how long a `running` job may take. A worker keeps
 the job alive by renewing its lease (`LEASE_SECS`, default **60s**, renewed
 every few seconds while it works). Only when the lease expires — worker dead,
-crashed, or no longer renewing — does the reaper mark the job `timed_out`
-with `lease expired`. There is no "running for 10 minutes, kill it" rule.
+crashed, or no longer renewing — does the 15s reaper mark the job `timed_out`
+with `lease expired`. There is no "running for 10 minutes, kill it" rule and
+no `claimed_at` age check: the old global knife that ignored `timeout_secs`
+and lease renewal is gone. Per-job patience is the worker's business (see
+§ Pi idle wait above). Queued jobs whose target agent is offline still land
+as `no_agent`.
 
 ## Terminal webhook (server → your bot)
 
