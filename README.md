@@ -97,30 +97,30 @@ curl -sS http://127.0.0.1:8787/v1/agents \
 | **`steer`** (default) | prompt with `streamingBehavior: steer` — interrupt/redirect current turn |
 | **`queue`** | idle → plain prompt; busy → prompt with `streamingBehavior: followUp` |
 
-### Pi idle wait (inactivity first, adaptive absolute budget)
+### Pi idle wait (no timeout for a live agent)
 
 After the RPC prompt is accepted, the worker waits for the Pi session to go
-idle. **Silence is what ends a wait**, not elapsed time (see
+idle. A wait ends on an **observed ending**, never on a clock (see
 `src/bin/worker/runtime.rs`):
 
-- **Inactivity budget — 600s (10 min)** with no observable progress
-  (`running` state, or `text_tail` / `last_tool` / `settled_count` changing).
-  Every progress tick refreshes the deadline, so a 6-hour coding run is fine.
-- **The absolute wait budget is that same silence budget**, raised — never
-  lowered — when the job or its payload declares a longer command timeout:
-  `max(600s, timeout_secs + 60s slack)`. A shell/act job that asks for a 2h
-  command gets ~2h of patience instead of being killed at 1h. A bare shell
-  with no timeout keeps its own **60s** command timeout
-  (`DEFAULT_SHELL_TIMEOUT`), which is a different thing from the Pi wait.
+- **`idle` after the agent's last message = `succeeded`.** The turn settled
+  (`agent_settled` / `settled_count` bump) — normal finish, normal success.
+- **No inactivity kill.** A quiet agent that is still running its loop —
+  thinking, running a long command, waiting on a slow model — keeps the job
+  `running` for hours. There is no "no output for N seconds → timeout" rule
+  any more (no 600s budget, no 1h cap).
+- **`timed_out` means the worker lost the agent:** the `pi` child exited
+  (`failed` with `pi child process exited …`), or the lease is gone (job
+  reaped / reassigned / server unreachable → the wait ends `lost agent: …`).
+  A lost lease only counts on a definitive answer (HTTP 403/404/409); a
+  network blip never fails a healthy job.
 
-There is no flat wall-clock cap (no more "1h and you are done"). A hang with
-zero progress fails after the budget with `timeout_kind: "inactivity"`,
-`wait_timeout: true`, the value used in `wait_budget_secs`, and a plain
-message (`Pi inactivity timeout after 7260s with no progress ...`). A send
-that never starts the agent fails with its own distinct message.
+`timeout_secs` (`host-ops job create|steer --timeout N`) bounds **that shell
+command** for `shell` jobs (default 60s). It does not bound a Pi turn and it
+never turns an idle finish into a timeout.
 
-`host-ops job create|steer --timeout N` sets the job's command timeout; it
-raises the Pi wait budget to at least `N + 60s`, it never shortens a wait.
+Each wait reports why it ended in `result.wait_end`
+(`idle` | `terminal` | `stopped` | `unreachable`).
 
 ### Pi child liveness (no pi_svc)
 
@@ -182,13 +182,14 @@ Claim is atomic and **matched**: `target.agent_id`, or filter (`project` / `capa
 
 Statuses: `queued` | `running` | `succeeded` | `failed` | `timed_out` | `no_agent`
 
-Nothing on the server caps how long a `running` job may take. A worker keeps
-the job alive by renewing its lease (`LEASE_SECS`, default **60s**, renewed
-every few seconds while it works). Only when the lease expires — worker dead,
-crashed, or no longer renewing — does the 15s reaper mark the job `timed_out`
-with `lease expired`. There is no "running for 10 minutes, kill it" rule and
-no `claimed_at` age check: the old global knife that ignored `timeout_secs`
-and lease renewal is gone. Per-job patience is the worker's business (see
+Nothing on the server caps how long a `running` job may take, and nothing
+kills a live-but-quiet job. A worker keeps the job alive by renewing its lease
+(`LEASE_SECS`, default **60s**, renewed every few seconds while it works).
+Only when the lease expires — worker dead, crashed, or no longer renewing —
+does the 15s reaper mark the job `timed_out` with `lease expired`. That is the
+only source of `timed_out`: the agent became unreachable. There is no
+"running for 10 minutes, kill it" rule, no `claimed_at` age check, and no
+inactivity reaper; per-job patience is the worker's business (see
 § Pi idle wait above). Queued jobs whose target agent is offline still land
 as `no_agent`.
 

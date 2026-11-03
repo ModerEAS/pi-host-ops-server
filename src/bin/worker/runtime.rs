@@ -22,12 +22,6 @@ use crate::config::{reject_fast, DEFAULT_MODEL, DEFAULT_PROVIDER};
 
 const MAX_RESULT_BYTES: usize = 512 * 1024;
 const DEFAULT_SHELL_TIMEOUT: u64 = 60;
-/// Silence tolerated with no observable Pi progress (10 min) — the primary
-/// timeout for a Pi job: a healthy busy run never dies from the wall clock.
-const DEFAULT_PI_INACTIVITY_SECS: f64 = 600.0;
-/// Slack added when a declared command timeout raises the Pi wait budget, so
-/// the wait outlives the command it is waiting on instead of racing it.
-const PI_WAIT_SLACK_SECS: u64 = 60;
 const POLL_STATUS_INTERVAL: f64 = 2.0;
 
 const PI_JOB_TYPES: &[&str] = &["observe", "act", "open", "clipboard", "notify"];
@@ -267,15 +261,29 @@ impl ApiClient {
             .await;
     }
 
-    pub async fn renew_lease(&self, job_id: &str) {
-        let _ = self
+    /// Renew the job lease.
+    ///
+    /// `Lost` is a definitive server answer that this job is no longer ours
+    /// (gone / reassigned / already terminal) — the way a wait learns it lost
+    /// the agent, e.g. after the lease reaper timed the job out. Transport
+    /// errors are not `Lost`: the reaper, not a flaky packet, decides a job is
+    /// dead.
+    pub async fn renew_lease(&self, job_id: &str) -> LeaseRenew {
+        match self
             .request(
                 reqwest::Method::POST,
                 &format!("/v1/agent/jobs/{job_id}/lease"),
                 Some(json!({})),
                 15,
             )
-            .await;
+            .await
+        {
+            Ok((status, body)) => match lease_lost(status, body.as_ref()) {
+                Some(reason) => LeaseRenew::Lost(reason),
+                None => LeaseRenew::Ok,
+            },
+            Err(_) => LeaseRenew::Ok,
+        }
     }
 
     pub async fn poll_once(&self, wait_secs: u64) -> Result<Option<Job>> {
@@ -1039,34 +1047,23 @@ job_id: {}\ntype: {}\ntimeout_secs: {:?}\npayload:\n{}\n",
     )
 }
 
-/// Observable Pi progress snapshot driving the idle-wait policy.
-#[derive(Debug, Clone, Default, PartialEq)]
-struct PiProgress {
-    running: bool,
-    settled_count: Option<i64>,
-    last_tool: Option<String>,
-    text_tail: String,
+/// Lease renewal result; see [`ApiClient::renew_lease`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseRenew {
+    Ok,
+    Lost(String),
 }
 
-impl PiProgress {
-    fn from_state(s: &PiState) -> Self {
-        Self {
-            running: s.state == "running",
-            settled_count: Some(s.settled_count),
-            last_tool: s.last_tool.clone(),
-            text_tail: s.text_tail(),
-        }
+/// A definitive "this job is no longer mine" answer from the lease endpoint.
+/// Anything else (2xx, 5xx, transport error) is not a loss.
+fn lease_lost(status: u16, body: Option<&Value>) -> Option<String> {
+    if !matches!(status, 403 | 404 | 409) {
+        return None;
     }
-
-    /// The agent is observably doing work (or produced new output) since prev.
-    /// `running` alone counts — a coding agent thinking without emitting
-    /// tools/text for a while is still working, not stuck.
-    fn advanced_since(&self, prev: &Self) -> bool {
-        self.running
-            || self.settled_count != prev.settled_count
-            || self.last_tool != prev.last_tool
-            || self.text_tail != prev.text_tail
-    }
+    Some(match body.and_then(|b| b.get("error")).and_then(|v| v.as_str()) {
+        Some(e) => format!("HTTP {status}: {e}"),
+        None => format!("HTTP {status}"),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1075,32 +1072,47 @@ enum WaitEnd {
     IdleDone,
     Terminal,
     Stopped,
-    TimeoutInactivity,
+    /// The lease is gone: job reaped/reassigned, or the worker cannot reach
+    /// the server any more. The only timeout-shaped ending.
+    Lost,
 }
 
-/// Pure idle-wait policy (fake-clock friendly: callers pass elapsed times).
-/// Terminal/idle wins over the timeout. Only silence ends a healthy wait —
-/// total elapsed time is deliberately not a parameter.
-fn decide_wait(
-    terminal: bool,
-    idle_done: bool,
-    quiet_secs: f64,
-    budget_secs: f64,
-) -> WaitEnd {
+impl WaitEnd {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::IdleDone => "idle",
+            Self::Terminal => "terminal",
+            Self::Stopped => "stopped",
+            Self::Lost => "unreachable",
+        }
+    }
+}
+
+/// Pure idle-wait policy.
+///
+/// There is deliberately no time input: time alone never ends a wait. A quiet
+/// agent that is still running its loop (thinking, a long command, a slow
+/// model) is working, not stuck — when it finishes, `idle_done` makes the job
+/// succeed. Only losing the agent ends a wait early: a dead child (`terminal`)
+/// or a lost lease (`lost`).
+fn decide_wait(terminal: bool, idle_done: bool, lost: bool) -> WaitEnd {
     if terminal {
         return WaitEnd::Terminal;
     }
     if idle_done {
         return WaitEnd::IdleDone;
     }
-    if quiet_secs >= budget_secs {
-        return WaitEnd::TimeoutInactivity;
+    if lost {
+        return WaitEnd::Lost;
     }
     WaitEnd::Continue
 }
 
 /// Command timeout the job asked for, if any (`timeout_secs` on the job or in
 /// the payload, e.g. a 2h shell). `0` / negative means "unset".
+///
+/// This bounds **that shell command** only; it never bounds a Pi turn.
 fn declared_timeout_secs(job: &Job) -> Option<u64> {
     job.timeout_secs
         .or_else(|| job.payload.get("timeout_secs").and_then(|v| v.as_i64()))
@@ -1108,49 +1120,37 @@ fn declared_timeout_secs(job: &Job) -> Option<u64> {
         .map(|t| t as u64)
 }
 
-/// Longest silence tolerated before the Pi wait ends.
-///
-/// Inactivity first: **600s** with no observable progress. That budget is also
-/// the job's absolute wait budget — it adapts upward, never down, when the job
-/// or its payload declares a longer command timeout (a 2h shell → ~2h wait),
-/// so the old flat 1h cap can never truncate work that explicitly asked for
-/// longer. Progress refreshes it, so a busy agent is never cut off.
-fn wait_budget_secs(declared_command_timeout_secs: Option<u64>) -> f64 {
-    let declared = declared_command_timeout_secs.unwrap_or(0) as f64;
-    DEFAULT_PI_INACTIVITY_SECS.max(declared + PI_WAIT_SLACK_SECS as f64)
-}
-
 struct WaitOutcome {
     status: PiState,
     end: WaitEnd,
-    saw_running: bool,
+    lost: Option<String>,
 }
 
-/// Activity-based wait for the Pi session to go idle after the prompt is
-/// accepted. One sliding budget (`budget_secs`): refreshed by observable
-/// progress, ended only by silence. Progress comes from the owned child's
-/// in-memory state, and a dead child ends the wait as a failure — never as
-/// idle success. Lease renewals + progress events continue as today.
+/// Wait for the Pi session to go idle after the prompt is accepted.
+///
+/// Ends only on an observed ending: the turn settled (`idle`), a terminal
+/// session state, a stop request, or a lost lease. No wall clock and no
+/// inactivity budget — a quiet-but-alive agent is never killed here. Progress
+/// events and lease renewals keep flowing so the server-side lease reaper (the
+/// only producer of `timed_out`) can tell a busy worker from a gone one.
 async fn wait_until_idle_with_events(
     api: &ApiClient,
     sess: &PiSession,
     job_id: &str,
-    budget_secs: f64,
     event_interval_secs: f64,
     settled_before: Option<i64>,
     stop: &AtomicBool,
 ) -> WaitOutcome {
-    let mut last_progress_at = Instant::now();
-    let mut prev = PiProgress::default();
     let mut last = PiState { state: "starting".into(), ..Default::default() };
     let mut saw_running = false;
+    let mut lost: Option<String> = None;
     let mut last_event_at = Instant::now() - Duration::from_secs(3600);
     let mut last_tail = String::new();
     let mut last_tool: Option<String> = None;
 
     loop {
         if stop.load(Ordering::Relaxed) {
-            return WaitOutcome { status: last, end: WaitEnd::Stopped, saw_running };
+            return WaitOutcome { status: last, end: WaitEnd::Stopped, lost };
         }
         // Subscribe before snapshotting so a settle/exit landing in between
         // still wakes us: completion uploads the result at once.
@@ -1167,15 +1167,10 @@ async fn wait_until_idle_with_events(
                 cur_state.error = Some(format!("pi child exited code={code:?}"));
             }
         }
-        let cur = PiProgress::from_state(&cur_state);
-        if cur.running {
+        if cur_state.state == "running" {
             saw_running = true;
         }
         let now = Instant::now();
-        if cur.advanced_since(&prev) {
-            last_progress_at = now;
-        }
-        prev = cur;
         last = cur_state;
         let tool = last.last_tool.clone();
         let text_tail = last.text_tail();
@@ -1191,21 +1186,18 @@ async fn wait_until_idle_with_events(
                 last_tail = text_tail;
             }
             api.post_event(job_id, "status", Some(&format!("state={}", last.state)), Some(json!({"state": last.state, "settled_count": last.settled_count}))).await;
-            api.renew_lease(job_id).await;
+            if let LeaseRenew::Lost(reason) = api.renew_lease(job_id).await {
+                lost = Some(reason);
+            }
             last_event_at = now;
         }
         let terminal = matches!(last.state.as_str(), "error" | "dead" | "stopped");
         let bumped = matches!(settled_before, Some(b) if last.settled_count > b);
         let idle_done = last.state == "idle" && (bumped || saw_running);
-        let end = decide_wait(
-            terminal,
-            idle_done,
-            last_progress_at.elapsed().as_secs_f64(),
-            budget_secs,
-        );
+        let end = decide_wait(terminal, idle_done, lost.is_some());
         match end {
             WaitEnd::Continue => {}
-            _ => return WaitOutcome { status: last, end, saw_running },
+            _ => return WaitOutcome { status: last, end, lost },
         }
         // Event-driven wakeup (settle/exit/progress) with the 2s tick only
         // as a fallback — no post-settle aliveness dance, just upload.
@@ -1231,16 +1223,6 @@ async fn run_via_pi(
     };
     let settled_before = Some(sess.snapshot().await.settled_count);
     let prompt = build_pi_prompt(job);
-    // Inactivity-first: silence ends this wait. A declared command timeout
-    // (job or payload) only raises the budget, never lowers it.
-    let declared = declared_timeout_secs(job);
-    let budget_secs = wait_budget_secs(declared);
-    let budget_why = match declared {
-        Some(t) if budget_secs > DEFAULT_PI_INACTIVITY_SECS => {
-            format!("; budget raised for a {t}s command timeout")
-        }
-        _ => String::new(),
-    };
 
     let delivery = job.delivery_mode.as_deref().unwrap_or("steer").trim().to_lowercase();
     let job_id = job.id.to_string();
@@ -1264,11 +1246,9 @@ async fn run_via_pi(
         return (false, None, Some(format!("pi rejected prompt: {}", accept.error.unwrap_or_else(|| "unknown".into()))));
     }
     info!(session = %rt.pi_session, disposition = ?accept.disposition, "pi rpc prompt accepted");
-    let outcome = wait_until_idle_with_events(api, &sess, &job_id, budget_secs, rt.event_interval_secs, settled_before, stop).await;
+    let outcome = wait_until_idle_with_events(api, &sess, &job_id, rt.event_interval_secs, settled_before, stop).await;
     let st = outcome.status;
     let text_tail = st.text_tail();
-    let wait_timeout = outcome.end == WaitEnd::TimeoutInactivity;
-    let timeout_kind = wait_timeout.then_some("inactivity");
     let result = truncate_result(json!({
         "via": "pi_rpc",
         "session": rt.pi_session,
@@ -1280,9 +1260,8 @@ async fn run_via_pi(
         "last_tool": st.last_tool,
         "text_tail": text_tail,
         "text_log_tail": tail_chars(st.text_log(), 8000),
-        "wait_timeout": wait_timeout,
-        "timeout_kind": timeout_kind,
-        "wait_budget_secs": budget_secs,
+        // idle | terminal | stopped | unreachable: why the wait ended.
+        "wait_end": outcome.end.as_str(),
     }));
     let mut ok = true;
     let mut err_msg = None;
@@ -1296,20 +1275,13 @@ async fn run_via_pi(
     } else if matches!(st.state.as_str(), "error" | "stopped") {
         ok = false;
         err_msg = Some(st.error.clone().unwrap_or_else(|| format!("session state={}", st.state)));
-    } else if outcome.end == WaitEnd::TimeoutInactivity {
+    } else if let Some(reason) = outcome.lost {
+        // Unreachable agent: the lease is gone (job reaped because the worker
+        // stopped heartbeating, reassigned, or the server is unreachable).
         ok = false;
-        err_msg = Some(if !outcome.saw_running && st.state != "idle" {
-            format!(
-                "Pi inactivity timeout after {}s: send accepted but agent never started (state={}){budget_why}",
-                budget_secs as u64,
-                st.state,
-            )
-        } else {
-            format!(
-                "Pi inactivity timeout after {}s with no progress (state={}){budget_why}",
-                budget_secs as u64, st.state,
-            )
-        });
+        err_msg = Some(format!(
+            "lost agent: {reason}; job is no longer running here (lease expired, reassigned, or worker unreachable)"
+        ));
     }
     (ok, Some(result), err_msg)
 }
@@ -1399,57 +1371,57 @@ mod tests {
         assert!(reject_fast("x", "foo-fast").is_err());
     }
 
-    fn progress(state: &str, tail: &str, tool: Option<&str>, settled: i64) -> PiProgress {
-        let mut st = PiState::default();
-        st.state = state.into();
-        st.push_text(tail);
-        st.last_tool = tool.map(|s| s.to_string());
-        st.settled_count = settled;
-        PiProgress::from_state(&st)
+    /// Policy: there is no time input at all — only an observed ending ends a
+    /// wait. `timed_out` is never "quiet for a while".
+    #[test]
+    fn wait_policy_time_never_ends_a_wait() {
+        // Quiet but alive (running a turn / a command / a slow model) → keep
+        // waiting, no matter how long.
+        assert_eq!(decide_wait(false, false, false), WaitEnd::Continue);
+        // Normal finish: the agent settled after its last message → success.
+        assert_eq!(decide_wait(false, true, false), WaitEnd::IdleDone);
+        // ... even if the lease was lost in the same tick: it really finished.
+        assert_eq!(decide_wait(false, true, true), WaitEnd::IdleDone);
+        // Dead child / error / stopped → failed, never fake success.
+        assert_eq!(decide_wait(true, false, false), WaitEnd::Terminal);
+        // Lost agent (lease gone / job reaped / unreachable) → the only
+        // timeout-shaped ending.
+        assert_eq!(decide_wait(false, false, true), WaitEnd::Lost);
     }
 
+    /// The old 600s inactivity knife is gone: a run that sits quiet for hours
+    /// and then finishes must end as `IdleDone`, never as a timeout.
     #[test]
-    fn progress_advances_on_running_or_changed_output() {
-        // Idle with no output change is not progress.
-        let base = progress("idle", "", None, 0);
-        assert!(!base.advanced_since(&progress("idle", "", None, 0)));
-        // Running alone counts — a thinking agent emitting nothing is working.
-        assert!(progress("running", "", None, 0).advanced_since(&base));
-        // New text / tool / settled count counts even when not running.
-        assert!(progress("idle", "ab", None, 0).advanced_since(&base));
-        assert!(progress("idle", "", Some("wiki_observe"), 0).advanced_since(&base));
-        assert!(progress("idle", "", None, 1).advanced_since(&base));
-        // Identical snapshot twice is not progress.
-        let same = progress("idle", "ab", Some("wiki_observe"), 1);
-        assert!(!same.advanced_since(&same));
+    fn wait_policy_quiet_hours_then_done_is_success() {
+        let mut saw_running = false;
+        for minute in 0..180 {
+            let state = if minute < 179 { "running" } else { "idle" };
+            if state == "running" {
+                saw_running = true;
+            }
+            let idle_done = state == "idle" && saw_running;
+            assert_eq!(
+                decide_wait(false, idle_done, false),
+                if idle_done { WaitEnd::IdleDone } else { WaitEnd::Continue },
+                "quiet minute {minute} must not end the wait"
+            );
+        }
     }
 
+    /// Only a definitive lease answer counts as a lost agent; a flaky packet or
+    /// a 5xx must never fail a healthy run.
     #[test]
-    fn wait_policy_branches() {
-        let budget = wait_budget_secs(None);
-        assert_eq!(budget, 600.0, "inactivity-first default");
-        // Still working just under the budget → keep waiting.
-        assert_eq!(decide_wait(false, false, 599.0, budget), WaitEnd::Continue);
-        // Silence at the budget → timeout.
-        assert_eq!(decide_wait(false, false, 600.0, budget), WaitEnd::TimeoutInactivity);
-        // Idle after running → success, even right at the deadline.
-        assert_eq!(decide_wait(false, true, 600.0, budget), WaitEnd::IdleDone);
-        // Terminal state beats the timeout.
-        assert_eq!(decide_wait(true, false, 600.0, budget), WaitEnd::Terminal);
-    }
-
-    /// A declared inner command timeout raises the wait budget, so a 2h shell is
-    /// never killed at the old flat 1h (3600s). Shorter declarations never lower
-    /// the inactivity default.
-    #[test]
-    fn wait_budget_adapts_up_to_long_command_timeout() {
-        assert_eq!(wait_budget_secs(None), 600.0);
-        assert_eq!(wait_budget_secs(Some(0)), 600.0);
-        assert_eq!(wait_budget_secs(Some(60)), 600.0);
-        let two_hours = wait_budget_secs(Some(7200));
-        assert!(two_hours >= 7200.0, "budget {two_hours} must cover a 2h command");
-        assert_eq!(two_hours, 7260.0);
-        assert_eq!(wait_budget_secs(Some(3 * 3600)), 3.0 * 3600.0 + 60.0);
+    fn lease_loss_only_on_definitive_answers() {
+        let body = json!({"error": "job is not running"});
+        assert_eq!(lease_lost(200, None), None);
+        assert_eq!(lease_lost(500, Some(&body)), None);
+        assert_eq!(lease_lost(409, None).as_deref(), Some("HTTP 409"));
+        for status in [403, 404, 409] {
+            assert_eq!(
+                lease_lost(status, Some(&body)).as_deref(),
+                Some(format!("HTTP {status}: job is not running").as_str())
+            );
+        }
     }
 
     fn job_with(payload: Value, timeout_secs: Option<i64>) -> Job {
@@ -1477,109 +1449,10 @@ mod tests {
         );
         assert_eq!(declared_timeout_secs(&job_with(json!({}), Some(0))), None);
         assert_eq!(declared_timeout_secs(&job_with(json!({"timeout_secs": -5}), Some(0))), None);
-        // A 2h shell command lifts the Pi wait budget past 1h.
+        // A 2h command timeout is read from the job/payload and used by the
+        // local shell path only — it never bounds a Pi turn.
         let job = job_with(json!({"command": "make", "timeout_secs": 7200}), None);
-        assert!(wait_budget_secs(declared_timeout_secs(&job)) >= 7200.0);
-    }
-
-    /// Fold a status timeline through the same progress/idle accounting the
-    /// wait loop uses (fake clock): replicates the b76169c6 repro — a slow
-    /// coding run with occasional output must not time out at old 300s.
-    #[test]
-    fn wait_policy_survives_slow_coding_run() {
-        // A slow coding run with a 2h-capable command timeout.
-        let inact = wait_budget_secs(Some(7200));
-        // (state, tail, tool, settled, dt_secs)
-        let timeline: Vec<(&str, &str, Option<&str>, i64, f64)> = vec![
-            ("idle", "", None, 0, 2.0), // send just dispatched
-            ("running", "step 1", None, 0, 120.0),
-            ("running", "step 1", Some("wiki_observe"), 0, 300.0),
-            ("running", "step 2: editing", Some("wiki_observe"), 0, 590.0),
-            // Long quiet stretch, still running → progress, timer refreshes.
-            ("running", "step 2: editing", Some("wiki_observe"), 0, 590.0),
-            ("idle", "done", Some("wiki_observe"), 1, 5.0),
-        ];
-        let mut prev = PiProgress::default();
-        let mut saw_running = false;
-        let mut idle_e = 0.0;
-        let mut end = WaitEnd::Continue;
-        for (state, tail, tool, settled, dt) in &timeline {
-            let cur = progress(state, tail, *tool, *settled);
-            if cur.running {
-                saw_running = true;
-            }
-            if cur.advanced_since(&prev) {
-                idle_e = 0.0;
-            } else {
-                idle_e += dt;
-            }
-            prev = cur;
-            let idle_done = *state == "idle" && saw_running;
-            end = decide_wait(false, idle_done, idle_e, inact);
-            if end != WaitEnd::Continue {
-                break;
-            }
-        }
-        assert_eq!(end, WaitEnd::IdleDone);
-    }
-
-    /// The headline requirement: busy past 1h with fresh progress is not killed.
-    #[test]
-    fn wait_policy_busy_run_past_one_hour_never_times_out() {
-        let inact = wait_budget_secs(Some(7200));
-        let mut prev = PiProgress::default();
-        let mut saw_running = false;
-        let mut quiet = 0.0;
-        let mut elapsed = 0.0;
-        let mut end = WaitEnd::Continue;
-        // 4 hours of work: a tool call every 5 min, never 600s of silence.
-        for step in 0..48 {
-            let (state, tail, tool, settled, dt) = if step == 47 {
-                ("idle", "done", Some("wiki_observe"), 1, 5.0)
-            } else {
-                ("running", "step", Some("bash"), 0, 305.0)
-            };
-            let cur = progress(state, &format!("{tail}{step}"), tool, settled);
-            if cur.running {
-                saw_running = true;
-            }
-            if cur.advanced_since(&prev) {
-                quiet = 0.0;
-            } else {
-                quiet += dt;
-            }
-            prev = cur;
-            elapsed += dt;
-            let idle_done = state == "idle" && saw_running;
-            end = decide_wait(false, idle_done, quiet, inact);
-            if end != WaitEnd::Continue {
-                break;
-            }
-        }
-        assert!(elapsed > 3600.0, "timeline must pass the old 1h cap (was {elapsed}s)");
-        assert_eq!(end, WaitEnd::IdleDone);
-    }
-
-    #[test]
-    fn wait_policy_stuck_send_times_out_inactivity() {
-        // Steer accepted but the agent never starts: idle + no output.
-        let mut prev = PiProgress::default();
-        let mut idle_e = 0.0;
-        let mut end = WaitEnd::Continue;
-        for _ in 0..7 {
-            let cur = progress("idle", "", None, 0);
-            if cur.advanced_since(&prev) {
-                idle_e = 0.0;
-            } else {
-                idle_e += 100.0;
-            }
-            prev = cur;
-            end = decide_wait(false, false, idle_e, 600.0);
-            if end != WaitEnd::Continue {
-                break;
-            }
-        }
-        assert_eq!(end, WaitEnd::TimeoutInactivity);
+        assert_eq!(declared_timeout_secs(&job), Some(7200));
     }
 
     fn record(t: &str) -> Value {
@@ -1760,13 +1633,13 @@ time.sleep(60)
         let stop = AtomicBool::new(false);
         let t0 = std::time::Instant::now();
         let outcome = wait_until_idle_with_events(
-            &api, &sess, "job-test", 10.0, 0.01, settled_before, &stop,
+            &api, &sess, "job-test", 0.01, settled_before, &stop,
         )
         .await;
         let accept2 = p2.await.unwrap().expect("p2 accept");
         assert!(accept2.success);
         assert_eq!(outcome.end, WaitEnd::IdleDone);
-        assert!(outcome.saw_running);
+        assert!(outcome.lost.is_none());
         assert!(t0.elapsed() < Duration::from_secs(8), "settle must upload promptly");
 
         sessions.shutdown_all().await;

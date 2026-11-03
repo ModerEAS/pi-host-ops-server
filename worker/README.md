@@ -61,13 +61,13 @@ steps automatically when given a dispatcher token + host-ops URL.
 ## Pi idle wait
 
 After the RPC prompt is accepted, the worker waits for the session to go idle.
-Silence ends the wait, not the clock: the **inactivity budget** is **10 min**
-with no `running` state / output change, and every progress tick refreshes it.
-That budget *is* the job's absolute wait budget and it adapts **upward** when
-the job or payload declares a longer command timeout
-(`max(600s, timeout_secs + 60s)`), so a 2h command is not killed at 1h. It is
-reported as a wait timeout (`timeout_kind: inactivity`, `wait_budget_secs`),
-not a task failure. `--timeout` raises a Pi wait budget; it never shortens one.
-Bare shell jobs keep their own 60s command timeout unless they declare more.
+**Nothing times out a live agent**: the wait ends when the turn settles
+(`idle` → job `succeeded`), when the `pi` child exits, when the job is stopped,
+or when the lease is lost. A quiet-but-running agent (thinking, a 2h command,
+a slow model) is never killed — there is no inactivity budget and no
+wall-clock cap. `timed_out` only ever comes from the server lease reaper, i.e.
+the worker itself became unreachable. `result.wait_end` says why a wait ended
+(`idle` | `terminal` | `stopped` | `unreachable`). `--timeout` bounds a
+`shell` job's command (default 60s); it never bounds a Pi turn.
 
 Never uses Cursor CloudAgent / Fast.
