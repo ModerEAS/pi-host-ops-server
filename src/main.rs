@@ -23,16 +23,9 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-            let cutoff = chrono::Utc::now() - chrono::Duration::minutes(10);
             // Each reaper returns transitioned terminal jobs; webhook once per job, server-side.
-            match reaper_state.db.mark_timed_out(cutoff).await {
-                Ok(jobs) => {
-                    for job in jobs {
-                        pi_host_ops_server::webhook::spawn_webhook(&reaper_state, job);
-                    }
-                }
-                Err(e) => tracing::warn!(error = %e, "mark_timed_out failed"),
-            }
+            // No wall-clock job cap here: a running job lives as long as its worker
+            // keeps renewing the lease, so long coding runs survive.
             match reaper_state.db.mark_lease_expired().await {
                 Ok(jobs) => {
                     for job in jobs {

@@ -930,47 +930,9 @@ impl Db {
 
     // ── Reapers ─────────────────────────────────────────────────────────
 
-    /// Mark timed-out running jobs; returns transitioned jobs for terminal webhooks.
-    pub async fn mark_timed_out(&self, older_than: DateTime<Utc>) -> Result<Vec<Job>> {
-        let now = Utc::now().to_rfc3339();
-        let cutoff = older_than.to_rfc3339();
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM jobs WHERE status = 'running' AND claimed_at IS NOT NULL AND claimed_at < ?",
-        )
-        .bind(&cutoff)
-        .fetch_all(&self.pool)
-        .await?;
-        if ids.is_empty() {
-            return Ok(vec![]);
-        }
-        sqlx::query(
-            r#"
-            UPDATE jobs
-            SET status = 'timed_out', finished_at = ?, updated_at = ?,
-                error = COALESCE(error, 'job timed out while running'),
-                lease_expires_at = NULL
-            WHERE status = 'running' AND claimed_at IS NOT NULL AND claimed_at < ?
-            "#,
-        )
-        .bind(&now)
-        .bind(&now)
-        .bind(&cutoff)
-        .execute(&self.pool)
-        .await?;
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Ok(j) = Uuid::parse_str(&id) {
-                if let Ok(Some(job)) = self.get_job(j).await {
-                    if job.status == JobStatus::TimedOut {
-                        out.push(job);
-                    }
-                }
-            }
-        }
-        Ok(out)
-    }
-
     /// Mark lease-expired running jobs; returns transitioned jobs for webhooks.
+    /// This is the only recovery path for a claimed job whose worker died —
+    /// there is no fixed claimed_at age cap, so long jobs are never killed.
     pub async fn mark_lease_expired(&self) -> Result<Vec<Job>> {
         let now = Utc::now().to_rfc3339();
         let ids: Vec<String> = sqlx::query_scalar(

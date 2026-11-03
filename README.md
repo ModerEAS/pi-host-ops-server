@@ -70,8 +70,7 @@ curl -sS -X POST http://127.0.0.1:8787/v1/jobs \
     "type":"observe",
     "payload":{"focus":"cwd"},
     "target":{"agent_id":"duolinzao-scale"},
-    "thread_id":"feature-x",
-    "timeout_secs":180
+    "thread_id":"feature-x"
   }'
 # delivery_mode defaults to "steer"
 
@@ -98,23 +97,23 @@ curl -sS http://127.0.0.1:8787/v1/agents \
 | **`steer`** (default) | prompt with `streamingBehavior: steer` — interrupt/redirect current turn |
 | **`queue`** | idle → plain prompt; busy → prompt with `streamingBehavior: followUp` |
 
-### Pi idle wait (activity-based)
+### Pi idle wait (activity-based, no wall clock)
 
 After the RPC prompt is accepted, the worker waits for the Pi session to go
-idle with **two budgets** (see `src/bin/worker/runtime.rs`):
+idle with **one budget** (see `src/bin/worker/runtime.rs`):
 
-- **Absolute cap** — the job's `timeout_secs` if set, else **3600s (1h)**.
-  A long coding/`act` run never fails just for being slow.
 - **Inactivity budget** — **600s (10 min)** with no observable progress
   (`running` state, or `text_tail` / `last_tool` / `settled_count` changing).
-  While the agent works, the deadline keeps refreshing.
+  While the agent works, the deadline keeps refreshing, so a 6-hour coding
+  run is fine.
 
-A timeout while the agent is still `running` fails the job but says so
-plainly (`absolute Pi wait timeout after …: agent still running`), and the
-result keeps `wait_timeout`, `timeout_kind` (`absolute`/`inactivity`), and
-tails. A send that never starts the agent fails as an inactivity timeout
-with a distinct message. Pass `--timeout` (`host-ops job create` / `steer`)
-only when a job needs more than the 1h default.
+There is **no absolute wall-clock cap** on a Pi job. `timeout_secs` stays in
+the API for shell jobs (their own command timeout, default **60s**) and for
+`no_agent` routing of queued jobs; `host-ops job create --timeout` no longer
+shortens a Pi wait. An agent that hangs with zero progress still fails after
+10 min of silence, with `timeout_kind: "inactivity"`, `wait_timeout: true`,
+and a plain message (`Pi inactivity timeout after 600s with no progress ...`).
+A send that never starts the agent fails with its own distinct message.
 
 ### Pi child liveness (no pi_svc)
 
@@ -175,6 +174,12 @@ curl -sS -X POST http://127.0.0.1:8787/v1/agent/jobs/$ID/result \
 Claim is atomic and **matched**: `target.agent_id`, or filter (`project` / `capabilities` / `machine`), plus `thread_id` sticky routing. Respects `max_concurrency`.
 
 Statuses: `queued` | `running` | `succeeded` | `failed` | `timed_out` | `no_agent`
+
+Nothing on the server caps how long a `running` job may take. A worker keeps
+the job alive by renewing its lease (`LEASE_SECS`, default **60s**, renewed
+every few seconds while it works). Only when the lease expires — worker dead,
+crashed, or no longer renewing — does the reaper mark the job `timed_out`
+with `lease expired`. There is no "running for 10 minutes, kill it" rule.
 
 ## Terminal webhook (server → your bot)
 

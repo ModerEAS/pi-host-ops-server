@@ -22,11 +22,9 @@ use crate::config::{reject_fast, DEFAULT_MODEL, DEFAULT_PROVIDER};
 
 const MAX_RESULT_BYTES: usize = 512 * 1024;
 const DEFAULT_SHELL_TIMEOUT: u64 = 60;
-/// Absolute cap on the Pi idle wait when the job sets no `timeout_secs` (1h).
-/// A long coding/`act` run must never fail just for being slow.
-const DEFAULT_PI_ABS_TIMEOUT: u64 = 3600;
 /// Give up only after this long with no observable Pi activity (10 min).
-/// While the agent is `running` or its output keeps changing, we keep waiting.
+/// There is no wall-clock cap: a long coding/`act` run never fails for being
+/// slow, only for being genuinely stuck (see `decide_wait`).
 const DEFAULT_PI_INACTIVITY_SECS: f64 = 600.0;
 const POLL_STATUS_INTERVAL: f64 = 2.0;
 
@@ -1075,18 +1073,16 @@ enum WaitEnd {
     IdleDone,
     Terminal,
     Stopped,
-    TimeoutAbs,
     TimeoutInactivity,
 }
 
 /// Pure idle-wait policy (fake-clock friendly: callers pass elapsed times).
-/// Terminal/idle wins over timeouts; the absolute cap wins over inactivity.
+/// Terminal/idle wins over the timeout. Only silence ends a healthy wait —
+/// total elapsed time is deliberately not a parameter.
 fn decide_wait(
     terminal: bool,
     idle_done: bool,
-    abs_elapsed_secs: f64,
     idle_elapsed_secs: f64,
-    abs_timeout_secs: f64,
     inactivity_secs: f64,
 ) -> WaitEnd {
     if terminal {
@@ -1094,9 +1090,6 @@ fn decide_wait(
     }
     if idle_done {
         return WaitEnd::IdleDone;
-    }
-    if abs_elapsed_secs >= abs_timeout_secs {
-        return WaitEnd::TimeoutAbs;
     }
     if idle_elapsed_secs >= inactivity_secs {
         return WaitEnd::TimeoutInactivity;
@@ -1111,22 +1104,20 @@ struct WaitOutcome {
 }
 
 /// Activity-based wait for the Pi session to go idle after the prompt is
-/// accepted. Same two budgets as before (absolute cap + inactivity budget
-/// refreshed by observable progress). Progress now comes from the owned
+/// accepted. One budget: inactivity, refreshed by observable progress.
+/// Progress comes from the owned
 /// child's in-memory state, and a dead child ends the wait as a failure —
 /// never as idle success. Lease renewals + progress events continue as today.
 async fn wait_until_idle_with_events(
     api: &ApiClient,
     sess: &PiSession,
     job_id: &str,
-    abs_timeout_secs: f64,
     inactivity_secs: f64,
     event_interval_secs: f64,
     settled_before: Option<i64>,
     stop: &AtomicBool,
 ) -> WaitOutcome {
-    let start = Instant::now();
-    let mut last_progress_at = start;
+    let mut last_progress_at = Instant::now();
     let mut prev = PiProgress::default();
     let mut last = PiState { state: "starting".into(), ..Default::default() };
     let mut saw_running = false;
@@ -1186,9 +1177,7 @@ async fn wait_until_idle_with_events(
         let end = decide_wait(
             terminal,
             idle_done,
-            start.elapsed().as_secs_f64(),
             last_progress_at.elapsed().as_secs_f64(),
-            abs_timeout_secs,
             inactivity_secs,
         );
         match end {
@@ -1219,9 +1208,7 @@ async fn run_via_pi(
     };
     let settled_before = Some(sess.snapshot().await.settled_count);
     let prompt = build_pi_prompt(job);
-    // Absolute wait cap: explicit job timeout wins, else the 1h default.
-    // The inactivity budget (no observable progress) applies on top.
-    let abs_timeout_secs = job.timeout_secs.filter(|&t| t > 0).map(|t| t as f64).unwrap_or(DEFAULT_PI_ABS_TIMEOUT as f64);
+    // `timeout_secs` is NOT a Pi run cap; only silence ends this wait.
     let inactivity_secs = DEFAULT_PI_INACTIVITY_SECS;
 
     let delivery = job.delivery_mode.as_deref().unwrap_or("steer").trim().to_lowercase();
@@ -1246,15 +1233,11 @@ async fn run_via_pi(
         return (false, None, Some(format!("pi rejected prompt: {}", accept.error.unwrap_or_else(|| "unknown".into()))));
     }
     info!(session = %rt.pi_session, disposition = ?accept.disposition, "pi rpc prompt accepted");
-    let outcome = wait_until_idle_with_events(api, &sess, &job_id, abs_timeout_secs, inactivity_secs, rt.event_interval_secs, settled_before, stop).await;
+    let outcome = wait_until_idle_with_events(api, &sess, &job_id, inactivity_secs, rt.event_interval_secs, settled_before, stop).await;
     let st = outcome.status;
     let text_tail = st.text_tail();
-    let wait_timeout = matches!(outcome.end, WaitEnd::TimeoutAbs | WaitEnd::TimeoutInactivity);
-    let timeout_kind = match outcome.end {
-        WaitEnd::TimeoutAbs => Some("absolute"),
-        WaitEnd::TimeoutInactivity => Some("inactivity"),
-        _ => None,
-    };
+    let wait_timeout = outcome.end == WaitEnd::TimeoutInactivity;
+    let timeout_kind = wait_timeout.then_some("inactivity");
     let result = truncate_result(json!({
         "via": "pi_rpc",
         "session": rt.pi_session,
@@ -1281,15 +1264,6 @@ async fn run_via_pi(
     } else if matches!(st.state.as_str(), "error" | "stopped") {
         ok = false;
         err_msg = Some(st.error.clone().unwrap_or_else(|| format!("session state={}", st.state)));
-    } else if outcome.end == WaitEnd::TimeoutAbs {
-        // Never claim success on timeout — but say plainly the agent was
-        // still working, so this reads as "needs longer", not "task failed".
-        ok = false;
-        err_msg = Some(format!(
-            "absolute Pi wait timeout after {}s: agent still {}",
-            abs_timeout_secs as u64,
-            st.state,
-        ));
     } else if outcome.end == WaitEnd::TimeoutInactivity {
         ok = false;
         err_msg = Some(if !outcome.saw_running && st.state != "idle" {
@@ -1300,10 +1274,8 @@ async fn run_via_pi(
             )
         } else {
             format!(
-                "Pi inactivity timeout after {}s with no progress (state={}; absolute cap {}s)",
-                inactivity_secs as u64,
-                st.state,
-                abs_timeout_secs as u64,
+                "Pi inactivity timeout after {}s with no progress (state={})",
+                inactivity_secs as u64, st.state,
             )
         });
     }
@@ -1424,34 +1396,25 @@ mod tests {
 
     #[test]
     fn wait_policy_branches() {
-        let abs = 3600.0;
         let inact = 600.0;
-        // Long run, still working near the absolute cap → keep waiting.
-        // (The old flat-300s wall clock failed exactly this case.)
-        assert_eq!(
-            decide_wait(false, false, 3500.0, 5.0, abs, inact),
-            WaitEnd::Continue
-        );
+        // Long run, still working → keep waiting. There is no wall clock, so
+        // even an hour-long busy run continues.
+        assert_eq!(decide_wait(false, false, 5.0, inact), WaitEnd::Continue);
         // Silence past the inactivity budget → inactivity timeout.
-        assert_eq!(
-            decide_wait(false, false, 100.0, 600.0, abs, inact),
-            WaitEnd::TimeoutInactivity
-        );
-        // Absolute cap exceeded while still running → absolute timeout.
-        assert_eq!(
-            decide_wait(false, false, 3600.0, 5.0, abs, inact),
-            WaitEnd::TimeoutAbs
-        );
-        // Idle after running → success, even at the deadline.
-        assert_eq!(
-            decide_wait(false, true, 3600.0, 600.0, abs, inact),
-            WaitEnd::IdleDone
-        );
-        // Terminal state beats timeouts.
-        assert_eq!(
-            decide_wait(true, false, 3600.0, 600.0, abs, inact),
-            WaitEnd::Terminal
-        );
+        assert_eq!(decide_wait(false, false, 600.0, inact), WaitEnd::TimeoutInactivity);
+        // Idle after running → success, even right at the deadline.
+        assert_eq!(decide_wait(false, true, 600.0, inact), WaitEnd::IdleDone);
+        // Terminal state beats the timeout.
+        assert_eq!(decide_wait(true, false, 600.0, inact), WaitEnd::Terminal);
+    }
+
+    /// The old 3600s absolute cap must never end an active wait: the policy has
+    /// no elapsed-time input at all, only time since the last progress.
+    #[test]
+    fn wait_policy_has_no_absolute_cap() {
+        for idle_e in [0.0, 1.0, 599.0] {
+            assert_eq!(decide_wait(false, false, idle_e, 600.0), WaitEnd::Continue);
+        }
     }
 
     /// Fold a status timeline through the same progress/idle accounting the
@@ -1459,7 +1422,6 @@ mod tests {
     /// coding run with occasional output must not time out at old 300s.
     #[test]
     fn wait_policy_survives_slow_coding_run() {
-        let abs = 3600.0;
         let inact = 600.0;
         // (state, tail, tool, settled, dt_secs)
         let timeline: Vec<(&str, &str, Option<&str>, i64, f64)> = vec![
@@ -1473,7 +1435,6 @@ mod tests {
         ];
         let mut prev = PiProgress::default();
         let mut saw_running = false;
-        let mut abs_e = 0.0;
         let mut idle_e = 0.0;
         let mut end = WaitEnd::Continue;
         for (state, tail, tool, settled, dt) in &timeline {
@@ -1487,14 +1448,12 @@ mod tests {
                 idle_e += dt;
             }
             prev = cur;
-            abs_e += dt;
             let idle_done = *state == "idle" && saw_running;
-            end = decide_wait(false, idle_done, abs_e, idle_e, abs, inact);
+            end = decide_wait(false, idle_done, idle_e, inact);
             if end != WaitEnd::Continue {
                 break;
             }
         }
-        assert!(abs_e > 300.0, "timeline must outlast the old flat killer");
         assert_eq!(end, WaitEnd::IdleDone);
     }
 
@@ -1502,7 +1461,6 @@ mod tests {
     fn wait_policy_stuck_send_times_out_inactivity() {
         // Steer accepted but the agent never starts: idle + no output.
         let mut prev = PiProgress::default();
-        let mut abs_e = 0.0;
         let mut idle_e = 0.0;
         let mut end = WaitEnd::Continue;
         for _ in 0..7 {
@@ -1513,8 +1471,7 @@ mod tests {
                 idle_e += 100.0;
             }
             prev = cur;
-            abs_e += 100.0;
-            end = decide_wait(false, false, abs_e, idle_e, 3600.0, 600.0);
+            end = decide_wait(false, false, idle_e, 600.0);
             if end != WaitEnd::Continue {
                 break;
             }
@@ -1700,7 +1657,7 @@ time.sleep(60)
         let stop = AtomicBool::new(false);
         let t0 = std::time::Instant::now();
         let outcome = wait_until_idle_with_events(
-            &api, &sess, "job-test", 30.0, 10.0, 0.01, settled_before, &stop,
+            &api, &sess, "job-test", 10.0, 0.01, settled_before, &stop,
         )
         .await;
         let accept2 = p2.await.unwrap().expect("p2 accept");

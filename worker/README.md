@@ -60,11 +60,12 @@ steps automatically when given a dispatcher token + host-ops URL.
 
 ## Pi idle wait
 
-After the RPC prompt is accepted, the worker waits for the session to go idle with two
-budgets: an **absolute cap** (the job's `timeout_secs`, else **1h**) and an
-**inactivity budget** (**10 min** with no `running` state / output change).
-Long coding runs keep their lease renewed and stay alive while they work;
-a timeout while still `running` is reported as a wait timeout, not a task
-failure. Needs more than 1h? Pass `--timeout` on `host-ops job create` / `steer`.
+After the RPC prompt is accepted, the worker waits for the session to go idle with
+one budget: an **inactivity budget** (**10 min** with no `running` state / output
+change). There is no absolute wall-clock cap — long coding runs keep their lease
+renewed and stay alive for as long as they make progress. Only 10 minutes of
+silence ends the wait, reported as a wait timeout (`timeout_kind: inactivity`),
+not a task failure. `--timeout` does not shorten a Pi wait; it applies to shell
+jobs (own command timeout, default 60s).
 
 Never uses Cursor CloudAgent / Fast.
